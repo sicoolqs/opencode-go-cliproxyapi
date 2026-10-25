@@ -3,8 +3,11 @@
 package errclass
 
 import (
+	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
@@ -27,10 +30,11 @@ const (
 
 // Error describes classified request errors and retryability for CPA execution.
 type Error struct {
-	Class      Class
-	Message    string
-	StatusCode int
-	Retryable  bool
+	Class             Class
+	Message           string
+	StatusCode        int
+	Retryable         bool
+	RetryAfterSeconds int
 }
 
 func (e *Error) Error() string {
@@ -41,11 +45,21 @@ func (e *Error) Error() string {
 // Network/timeout failures (no status) use FromNetwork instead. A redacted
 // message containing "quota" (case-insensitive) upgrades 429/402/403 to
 // ClassQuota — a bounded heuristic given no documented upstream quota
-// taxonomy.
-func FromStatus(status int, message string) *Error {
+// taxonomy. Optional response headers are scanned for Retry-After retry
+// guidance (delay-seconds or HTTP-date); a valid positive value is carried
+// on the error so ToEnvelopeError can hand it to the host for auth
+// cooldowns and downstream Retry-After headers.
+func FromStatus(status int, message string, headers ...http.Header) *Error {
 	msg := Redact(message)
 	lowerMsg := strings.ToLower(msg)
 	quota := strings.Contains(lowerMsg, "quota")
+	retryAfter := 0
+	for _, h := range headers {
+		if v := RetryAfterFromHeaders(h); v > 0 {
+			retryAfter = v
+			break
+		}
+	}
 	quotaClass := func(base Class) Class {
 		if quota {
 			return ClassQuota
@@ -54,20 +68,50 @@ func FromStatus(status int, message string) *Error {
 	}
 	switch status {
 	case 401:
-		return &Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	case 403:
-		return &Error{Class: quotaClass(ClassAuth), Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: quotaClass(ClassAuth), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	case 402:
-		return &Error{Class: quotaClass(ClassBilling), Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: quotaClass(ClassBilling), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	case 404:
-		return &Error{Class: ClassInvalidModel, Message: msg, StatusCode: status}
+		return &Error{Class: ClassInvalidModel, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
 	case 429:
-		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	}
 	if status >= 500 {
-		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true}
+		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	}
-	return &Error{Class: ClassUnsupported, Message: msg, StatusCode: status}
+	return &Error{Class: ClassUnsupported, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
+}
+
+// RetryAfterFromHeaders extracts upstream retry guidance in seconds from
+// response headers: an integer delay-seconds value, or an HTTP-date
+// converted to remaining seconds. Invalid, past, or non-positive values
+// yield 0 so the host falls back to its default backoff. Only the first
+// header value is honored. Header names and values are fixed protocol
+// tokens — no secrets pass through here.
+func RetryAfterFromHeaders(h http.Header) int {
+	if len(h) == 0 {
+		return 0
+	}
+	raw := strings.TrimSpace(h.Get("Retry-After"))
+	if raw == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(raw); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return secs
+	}
+	if ts, err := http.ParseTime(raw); err == nil {
+		secs := int(time.Until(ts).Seconds())
+		if secs <= 0 {
+			return 0
+		}
+		return secs
+	}
+	return 0
 }
 
 // FromNetwork classifies a PRE-first-byte network/timeout failure; always
@@ -115,10 +159,11 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 		}
 	}
 	return pluginabi.Error{
-		Code:       string(e.Class),
-		Message:    Redact(e.Message),
-		Retryable:  e.Retryable,
-		HTTPStatus: status,
+		Code:              string(e.Class),
+		Message:           Redact(e.Message),
+		Retryable:         e.Retryable,
+		HTTPStatus:        status,
+		RetryAfterSeconds: e.RetryAfterSeconds,
 	}
 }
 

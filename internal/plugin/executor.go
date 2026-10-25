@@ -120,7 +120,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 	debugTrace("executor received non-stream status=%d body_len=%d", resp.StatusCode, len(resp.Body))
 	if resp.StatusCode >= 400 {
-		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body)), nil
+		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body, resp.Headers)), nil
 	}
 	// Parse/envelope guard only; true OOM prevention belongs to the host transport's byte cap.
 	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
@@ -307,7 +307,7 @@ func convertNonStream(route catalog.Route, sourceFormat string, status int, body
 }
 
 // classEnvelope renders a classified failure as the wire error envelope;
-// ToEnvelopeError redacts and propagates Retryable/HTTPStatus host-side.
+// ToEnvelopeError redacts and propagates Retryable/HTTPStatus/RetryAfterSeconds host-side.
 func classEnvelope(e *errclass.Error) []byte {
 	wire := errclass.ToEnvelopeError(e)
 	out, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &wire})
@@ -374,7 +374,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
-	st, _, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
+	st, stHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
@@ -394,7 +394,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 			watchdog.Stop()
 			_ = m.bridge.StreamClose(id)
 		}
-		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
+		return classEnvelope(shared.UpstreamStatusError(st, body, stHeaders)), nil
 	}
 
 	downID := req.StreamID

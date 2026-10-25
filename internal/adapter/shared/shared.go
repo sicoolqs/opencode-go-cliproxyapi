@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -907,7 +908,9 @@ func extractErrorMessage(body []byte) string {
 // its head, decoded for human-readable error messages if JSON, or fallen
 // back to a redacted snippet, then classified per §7 via errclass.FromStatus.
 // One kernel keeps bounding and redaction from diverging across call sites.
-func UpstreamStatusError(status int, body []byte) *errclass.Error {
+// Optional response headers carry Retry-After retry guidance into the
+// classified error for host cooldowns; callers without headers omit them.
+func UpstreamStatusError(status int, body []byte, headers ...http.Header) *errclass.Error {
 	if len(body) > snippetBound {
 		body = body[:snippetBound]
 	}
@@ -915,7 +918,7 @@ func UpstreamStatusError(status int, body []byte) *errclass.Error {
 	if msg == "" {
 		msg = string(body)
 	}
-	return errclass.FromStatus(status, RedactedSnippet(msg))
+	return errclass.FromStatus(status, RedactedSnippet(msg), headers...)
 }
 
 // ResponsesUsage is the token-usage block of synthesized Responses

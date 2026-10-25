@@ -36,7 +36,7 @@ const githubRepoURL = "https://github.com/massiveits/opencode-go-cliproxyapi"
 
 // registerRefreshTimeout bounds ONLY the synchronous initial/reconfigure
 // refreshOnce so a slow catalog cannot block host startup/reconfigure for a
-// full request-timeout (default 15m). On expiry registration proceeds per
+// full request-timeout (default 5m). On expiry registration proceeds per
 // FR-002 empty/stale semantics; the ticker retries at refresh-interval with
 // the full request-timeout.
 const registerRefreshTimeout = 10 * time.Second

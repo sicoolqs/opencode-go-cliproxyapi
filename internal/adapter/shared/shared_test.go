@@ -2,6 +2,7 @@ package shared
 
 import (
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -358,6 +359,15 @@ func TestUpstreamStatusError(t *testing.T) {
 		if e.Message != tc.want {
 			t.Errorf("UpstreamStatusError(400, %s) = %q, want %q", tc.body, e.Message, tc.want)
 		}
+	}
+
+	// Upstream Retry-After guidance survives into the classified error.
+	hinted := UpstreamStatusError(429, []byte("slow down"), http.Header{"Retry-After": {"7"}})
+	if hinted.RetryAfterSeconds != 7 || hinted.Class != errclass.ClassRateLimit {
+		t.Fatalf("hinted 429 = %+v, want rate_limit with 7s", hinted)
+	}
+	if plain := UpstreamStatusError(429, []byte("slow down")); plain.RetryAfterSeconds != 0 {
+		t.Fatalf("unhinted 429 RetryAfterSeconds = %d, want 0", plain.RetryAfterSeconds)
 	}
 }
 

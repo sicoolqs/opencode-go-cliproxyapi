@@ -2,7 +2,9 @@ package errclass
 
 import (
 	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
@@ -228,5 +230,63 @@ func TestRedactQueryKeys(t *testing.T) {
 		if again := Redact(got); again != got {
 			t.Errorf("Redact not idempotent on %q: %q", got, again)
 		}
+	}
+}
+
+func TestRetryAfterFromHeaders(t *testing.T) {
+	future := time.Now().Add(90 * time.Second).UTC().Format(http.TimeFormat)
+	past := time.Now().Add(-90 * time.Second).UTC().Format(http.TimeFormat)
+	tests := []struct {
+		name string
+		head http.Header
+		want int
+	}{
+		{"delay seconds", http.Header{"Retry-After": {"7"}}, 7},
+		{"delay seconds with whitespace", http.Header{"Retry-After": {"  30  "}}, 30},
+		{"http date in past", http.Header{"Retry-After": {past}}, 0},
+		{"zero delay", http.Header{"Retry-After": {"0"}}, 0},
+		{"negative delay", http.Header{"Retry-After": {"-5"}}, 0},
+		{"garbage value", http.Header{"Retry-After": {"soon"}}, 0},
+		{"missing header", http.Header{}, 0},
+		{"nil header", nil, 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RetryAfterFromHeaders(tc.head); got != tc.want {
+				t.Errorf("RetryAfterFromHeaders = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	if got := RetryAfterFromHeaders(http.Header{"Retry-After": {future}}); got < 88 || got > 90 {
+		t.Errorf("RetryAfterFromHeaders(http-date +90s) = %d, want ~89", got)
+	}
+}
+
+func TestFromStatusRetryAfter(t *testing.T) {
+	withHint := http.Header{"Retry-After": {"12"}}
+	if e := FromStatus(429, "slow down", withHint); e.RetryAfterSeconds != 12 || e.Class != ClassRateLimit {
+		t.Errorf("429 with Retry-After = %+v, want rate_limit with 12s", e)
+	}
+	if e := FromStatus(503, "overloaded", withHint); e.RetryAfterSeconds != 12 || !e.Retryable {
+		t.Errorf("503 with Retry-After = %+v, want retryable with 12s", e)
+	}
+	if e := FromStatus(429, "slow down"); e.RetryAfterSeconds != 0 {
+		t.Errorf("429 without headers RetryAfterSeconds = %d, want 0", e.RetryAfterSeconds)
+	}
+	if e := FromStatus(429, "slow down", http.Header{"Retry-After": {"bogus"}}); e.RetryAfterSeconds != 0 {
+		t.Errorf("429 with garbage Retry-After = %d, want 0", e.RetryAfterSeconds)
+	}
+}
+
+func TestToEnvelopeErrorRetryAfter(t *testing.T) {
+	in := &Error{Class: ClassRateLimit, Message: "slow down", StatusCode: 429, Retryable: true, RetryAfterSeconds: 12}
+	got := ToEnvelopeError(in)
+	want := pluginabi.Error{Code: "rate_limit", Message: "slow down", Retryable: true, HTTPStatus: 429, RetryAfterSeconds: 12}
+	if got != want {
+		t.Errorf("ToEnvelopeError = %+v, want %+v", got, want)
+	}
+	plain := &Error{Class: ClassUpstream, Message: "boom", StatusCode: 500, Retryable: true}
+	if got := ToEnvelopeError(plain); got.RetryAfterSeconds != 0 {
+		t.Errorf("ToEnvelopeError without hint RetryAfterSeconds = %d, want 0", got.RetryAfterSeconds)
 	}
 }

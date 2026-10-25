@@ -1,3 +1,9 @@
+## 未发布
+
+### 改进
+
+- 升级 CLIProxyAPI SDK 至 `v8.0.42`，并将上游错误响应的 `Retry-After` 指引（秒数或 HTTP-date）透传为 `retry_after_seconds`，使 CPA 认证冷却与下游重试头遵循上游提示。ABI/Schema 无变化。
+
 ## 本次变更
 
 ### Bug 修复
