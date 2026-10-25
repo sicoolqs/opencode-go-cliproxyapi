@@ -1,47 +1,47 @@
-# OpenCode Go CLIProxyAPI Plugin
+# OpenCode Go CLIProxyAPI 插件
 
-A native dynamic Go plugin for [CLIProxyAPI](https://help.router-for.me/plugin/development) that exposes OpenCode Go as a single provider (`opencode-go`).
+一个原生动态 Go 插件（适用于 [CLIProxyAPI](https://help.router-for.me/plugin/development)），将 OpenCode Go 以单一服务商（`opencode-go`）的形式暴露出来。
 
-The plugin unifies model discovery, protocol translation, and execution across OpenCode Go's upstream endpoints while leveraging CLIProxyAPI's built-in authentication, scheduling, keys rotation, and cooldown management.
+该插件统一了 OpenCode Go 上游各端点的模型发现、协议转换与执行，同时复用 CLIProxyAPI 内建的认证、调度、密钥轮换与冷却管理。
 
-## The Problem
+## 问题背景
 
-OpenCode Go exposes models across multiple API protocols (OpenAI Chat Completions `/v1/chat/completions`, Anthropic Messages `/v1/messages`, and OpenAI Responses `/v1/responses`).
+OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions `/v1/chat/completions`、Anthropic Messages `/v1/messages`、OpenAI Responses `/v1/responses`）。
 
-Without this plugin, using OpenCode Go in CLIProxyAPI requires configuring separate provider blocks for each protocol family. This leads to:
-- **Duplicated configuration & keys**: The same API keys must be configured across multiple provider blocks.
-- **Fragmented scheduling & rotation**: Keys rotation, rate limits, and cooldowns cannot be shared across protocols—exhausting quota on one protocol does not coordinate with another.
-- **Client protocol burden**: Clients must know beforehand which upstream protocol and endpoint each model requires.
-- **Fragmented catalog**: Models are split across disjoint provider namespaces instead of a unified model list.
+如果没有本插件，在 CLIProxyAPI 中使用 OpenCode Go 需要为每种协议分别配置 Provider，会带来以下问题：
+- **配置与密钥重复**：同一批 API 密钥必须在多个 Provider 配置块中重复填写。
+- **调度与轮换割裂**：密钥轮换、限流与冷却无法跨协议共享——一种协议上配额耗尽时无法与其他协议协同。
+- **客户端协议负担重**：客户端必须事先知道每个模型需要走哪个上游协议和端点。
+- **模型目录割裂**：模型被分散在互不相干的 Provider 命名空间下，没有统一的模型列表。
 
-## The Solution
+## 解决方案
 
-This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a shared keys pool:
-- **Unified auth pool**: Configure keys once; CLIProxyAPI schedules, rotates, and cools down keys across all protocols.
-- **Transparent protocol translation & routing**: Clients request models (e.g. `opencode-go/glm-5.2`, `opencode-go/gpt-5.6-luna`) without needing to know the upstream protocol format.
-- **Single model catalog**: All models are discovered and published under the `opencode-go` provider namespace in `/v1/models`.
+本插件将 OpenCode Go 以单一服务商（`opencode-go`）暴露，并由共享密钥池支撑：
+- **统一认证池**：只需配置一次密钥；CLIProxyAPI 会在所有协议间统一调度、轮换与冷却。
+- **透明的协议转换与路由**：客户端只需请求模型（如 `opencode-go/glm-5.2`、`opencode-go/gpt-5.6-luna`），无需关心上游协议格式。
+- **统一模型目录**：所有模型都会在 `/v1/models` 下以 `opencode-go` 服务商命名空间被发现和发布。
 
-## Features
+## 功能特性
 
-- **Single Provider Namespace**: Exposes models under the `opencode-go` provider prefix (e.g. `opencode-go/glm-5.2`, `opencode-go/qwen3.7-max`, `opencode-go/gpt-5.6-luna`).
-- **Multi-Protocol Translation**: Translates requests and streaming responses between client formats and upstream endpoints:
-  - OpenAI Chat Completions (`/v1/chat/completions`)
-  - Anthropic Messages (`/v1/messages`)
-  - OpenAI Responses (`/v1/responses`)
-- **Thinking & Reasoning Support**: Maps reasoning effort across supported client and upstream formats.
-- **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
-- **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
-- **Native quotas**: Rolling, weekly, and monthly quotas use CLIProxyAPI's generic quota endpoints and the selected credential. The separate plugin page is removed.
+- **单一服务商命名空间**：模型统一带 `opencode-go` 前缀暴露（如 `opencode-go/glm-5.2`、`opencode-go/qwen3.7-max`、`opencode-go/gpt-5.6-luna`）。
+- **多协议转换**：在客户端格式与上游端点之间转换请求与流式响应：
+  - OpenAI Chat Completions（`/v1/chat/completions`）
+  - Anthropic Messages（`/v1/messages`）
+  - OpenAI Responses（`/v1/responses`）
+- **思考与推理支持**：在受支持的客户端与上游格式之间映射推理强度（reasoning effort）。
+- **动态目录发现**：拉取远端模型目录，支持本地兜底与自定义路由覆盖。
+- **多密钥认证调度**：汇聚多个 API 密钥，复用 CLIProxyAPI 原生调度器，在所有协议间做轮换、重试与错误冷却。
+- **原生配额**：滚动、周、月配额统一走 CLIProxyAPI 通用配额接口，并使用当前选中的凭证。不再保留独立的插件页面。
 
-## Requirements
+## 环境要求
 
-- **CLIProxyAPI**: `v8.0.0+`
-- **Go Toolchain**: Go 1.26.7+ (with CGO enabled for C-shared build mode)
+- **CLIProxyAPI**：`v8.0.0+`
+- **Go 工具链**：Go 1.26.7+（C-shared 构建模式需要开启 CGO）
 
-## Build
+## 构建
 
-Build the shared library with the `debug` tag for local development.
-CI handles release builds.
+本地开发请带 `debug` 标签构建共享库。
+Release 构建由 CI 负责。
 
 ### Windows (AMD64)
 ```powershell
@@ -58,106 +58,105 @@ go build -tags debug -buildmode=c-shared -o plugins/linux/amd64/opencode-go-clip
 go build -tags debug -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cliproxyapi.dylib .
 ```
 
-Place the compiled binary into your CLIProxyAPI plugin directory (e.g. `<cliproxyapi_root>/plugins/<os>/<arch>/`).
+将编译产物放入 CLIProxyAPI 的插件目录（例如 `<cliproxyapi_root>/plugins/<os>/<arch>/`）。
 
-## Configuration
+## 配置
 
-Configure the plugin in your CLIProxyAPI `config.yaml` under `plugins.configs.opencode-go-cliproxyapi`:
+在 CLIProxyAPI 的 `config.yaml` 中通过 `plugins.configs.opencode-go-cliproxyapi` 配置本插件：
 
 ```yaml
 plugins:
   configs:
     opencode-go-cliproxyapi:
-      # Upstream base URL (default: "https://opencode.ai/zen/go/v1")
+      # 上游基地址（默认："https://opencode.ai/zen/go/v1"）
       base-url: "https://opencode.ai/zen/go/v1"
 
-      # Optional catalog endpoint override (default: "{base-url}/models")
+      # 可选的目录接口覆盖（默认："{base-url}/models"）
       # catalog-url: "https://opencode.ai/zen/go/v1/models"
 
-      # Client-facing model ID prefix configuration
+      # 面向客户端的模型 ID 前缀配置
       model-prefix:
-        enabled: true           # true -> "opencode-go/<model>", false -> bare "<model>" (default: true)
-        value: "opencode-go"    # prefix name (default: "opencode-go")
+        enabled: true           # true -> "opencode-go/<model>"，false -> 裸 "<model>"（默认：true）
+        value: "opencode-go"    # 前缀名称（默认："opencode-go"）
 
-      # OpenCode Go API keys (at least one required). Supports ${ENV_VAR} expansion.
+      # OpenCode Go API 密钥（至少填一个）。支持 ${ENV_VAR} 环境变量展开。
       api-keys:
         - value: "sk-opencode-key-1"
-          name: "Personal"      # optional account label
+          name: "Personal"      # 可选的账号备注
         - value: "sk-opencode-key-2"
         - value: "${OPENCODE_GO_API_KEY}"
 
-      # Catalog discovery settings
+      # 目录发现设置
       catalog:
-        refresh-interval: "15m"          # discovery refresh cadence, min "1m" (default: "15m")
-        stale-while-unavailable: true    # retain last good catalog snapshot on refresh failure (default: true)
+        refresh-interval: "15m"          # 目录刷新间隔，最小 "1m"（默认："15m"）
+        stale-while-unavailable: true    # 刷新失败时保留上一次可用的目录快照（默认：true）
 
-      # Protocol enable/disable switches (all default to true)
+      # 协议开关（默认全开）
       protocols:
-        chat-completions: true   # enables models routed to /v1/chat/completions
-        messages: true           # enables models routed to /v1/messages
-        responses: true          # enables models routed to /v1/responses
+        chat-completions: true   # 启用路由到 /v1/chat/completions 的模型
+        messages: true           # 启用路由到 /v1/messages 的模型
+        responses: true          # 启用路由到 /v1/responses 的模型
 
-      # Explicit route overrides per model (takes priority over built-in prefix routing)
+      # 按模型的显式路由覆盖（优先级高于内置前缀路由）
       route-overrides:
         "custom-model":
           protocol: "messages"           # "chat-completions" | "messages" | "responses"
-          endpoint: "/v1/messages"       # must start with /
+          endpoint: "/v1/messages"       # 必须以 / 开头
 
-      # Execution settings
-      request-timeout: "5m"              # upstream request timeout (default: "5m")
-      max-response-bytes: 67108864       # max non-streaming response body size in bytes (default: 64 MiB)
-      allow-http: false                  # allow http:// scheme for local mock/testing (default: false)
+      # 执行设置
+      request-timeout: "5m"              # 上游请求超时（默认："5m"）
+      max-response-bytes: 67108864       # 非流式响应体的最大字节数（默认：64 MiB）
+      allow-http: false                  # 是否允许 http:// 方案，用于本地 mock/测试（默认：false）
 ```
 
-### Configuration Options
+### 配置项说明
 
-| Option | Type | Default | Description |
+| 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `api-keys` | `[]object` | *(Required)* | List of API keys (`- value: "..."`, optional `name: "Personal"`). Supports `${ENV_VAR}` expansion. Duplicates and empty values are rejected. |
-| `base-url` | `string` | `https://opencode.ai/zen/go/v1` | Upstream base URL. Must be valid HTTPS (or HTTP if `allow-http: true`) without query parameters, fragments, or userinfo. |
-| `catalog-url` | `string` | `{base-url}/models` | Full URL for catalog discovery. Defaults to `{base-url}/models`. |
-| `model-prefix.enabled` | `bool` | `true` | When `true`, client-facing model names use `<prefix>/<model>`. When `false`, uses bare model IDs. |
-| `model-prefix.value` | `string` | `opencode-go` | Provider prefix string when prefixing is enabled. |
-| `catalog.refresh-interval` | `duration` | `15m` | Interval between catalog polling refreshes (e.g. `15m`, `1h`). Minimum is `1m`. |
-| `catalog.stale-while-unavailable` | `bool` | `true` | When `true`, serves the last valid catalog snapshot if an update fails. |
-| `protocols.chat-completions` | `bool` | `true` | Protocol switch for Chat Completions endpoints. |
-| `protocols.messages` | `bool` | `true` | Protocol switch for Messages endpoints. |
-| `protocols.responses` | `bool` | `true` | Protocol switch for Responses endpoints. |
-| `route-overrides` | `map` | `{}` | Map of model ID to `{ protocol: "...", endpoint: "..." }` overriding built-in family routing. Valid protocols: `chat-completions`, `messages`, `responses`. |
-| `request-timeout` | `duration` | `5m` | Upstream HTTP request timeout. Must be positive. |
-| `max-response-bytes` | `int64` | `67108864` (64 MiB) | Maximum non-streaming response body size in bytes. |
-| `allow-http` | `bool` | `false` | When `true`, permits `http://` scheme in `base-url` / `catalog-url` for local testing. |
+| `api-keys` | `[]object` | *（必填）* | API 密钥列表（`- value: "..."`，可选 `name: "Personal"`）。支持 `${ENV_VAR}` 展开。重复与空值会被拒绝。 |
+| `base-url` | `string` | `https://opencode.ai/zen/go/v1` | 上游基地址。必须是合法 HTTPS（`allow-http: true` 时可为 HTTP），且不带查询参数、fragment、userinfo。 |
+| `catalog-url` | `string` | `{base-url}/models` | 目录发现完整 URL。默认为 `{base-url}/models`。 |
+| `model-prefix.enabled` | `bool` | `true` | 为 `true` 时客户端模型名为 `<prefix>/<model>`；为 `false` 时使用裸模型 ID。 |
+| `model-prefix.value` | `string` | `opencode-go` | 开启前缀时的服务商前缀字符串。 |
+| `catalog.refresh-interval` | `duration` | `15m` | 目录轮询刷新间隔（如 `15m`、`1h`）。最小为 `1m`。 |
+| `catalog.stale-while-unavailable` | `bool` | `true` | 为 `true` 时，更新失败则继续提供上一次有效的目录快照。 |
+| `protocols.chat-completions` | `bool` | `true` | Chat Completions 端点的协议开关。 |
+| `protocols.messages` | `bool` | `true` | Messages 端点的协议开关。 |
+| `protocols.responses` | `bool` | `true` | Responses 端点的协议开关。 |
+| `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖内置的家族路由。合法协议：`chat-completions`、`messages`、`responses`。 |
+| `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。必须为正数。 |
+| `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
+| `allow-http` | `bool` | `false` | 为 `true` 时，`base-url` / `catalog-url` 允许使用 `http://` 方案，便于本地测试。 |
 
-## Testing
+## 测试
 
 ```powershell
-# Run all tests
+# 运行全部测试
 go test -tags debug ./...
 
-# Run tests with coverage
+# 带覆盖率运行测试
 go test -tags debug ./... -cover
 
-# Run linter / vetting
+# 运行 linter / vet 检查
 go vet ./...
 ```
 
-## Account names and quotas
+## 账号名称与配额
 
-Set an optional `name` on each `api-keys` entry, alongside `value`.
-For example, use `name: Personal` or `name: Work`. Without a name, one key
-uses **OpenCode Go**; multiple keys use **OpenCode Go 1**, **OpenCode Go 2**, and subsequent numbers.
-Default numbers follow configuration order. Explicit names remain stable when keys are reordered.
-The usage response contains no email or account identity. The plugin does not infer an email from a key.
+在每个 `api-keys` 条目的 `value` 之外，可选设置 `name`。
+例如 `name: Personal` 或 `name: Work`。未命名时，单个密钥显示为 **OpenCode Go**；多个密钥依次显示为 **OpenCode Go 1**、**OpenCode Go 2**，依此类推。
+默认编号按配置顺序生成。显式名称在密钥重排后保持稳定。
+用量响应中不包含邮箱或账号身份信息，插件也不会从密钥推断邮箱。
 
-New credential files have readable names. Existing auth IDs remain unchanged, and
-legacy generated labels are replaced when parsed. Existing custom labels are preserved
-unless configuration specifies a name. Existing filenames are retained automatically;
-stop CLIProxyAPI before renaming an old file to a readable `.json` filename, and keep
-its JSON `id` and all other fields unchanged. Back up the file first.
+新建凭证文件使用可读文件名。已存在的 auth ID 保持不变，
+解析时会替换掉旧的自动生成标签。已有的自定义标签会被保留，
+除非配置中指定了新的名称。已有文件名会自动保留；
+如需把旧文件重命名为可读的 `.json` 文件名，请先停止 CLIProxyAPI，并保持
+其 JSON 中的 `id` 与其他字段不变。操作前请先备份文件。
 
-Discover support with `GET /v0/management/quota/providers`, then call
-`POST /v0/management/quota/fetch` with `{"auth_index":"<selected index>"}`.
-These endpoints require the CLIProxyAPI management key. The normalized response contains
-`subscription.plan`, `groups[].buckets[].window`, `remainingFraction`, and `resetTime`.
-Missing windows are omitted. Invalid readings return an error, not an invented zero.
-Quota reset is unsupported. The old plugin quota route and resource page are removed.
+先用 `GET /v0/management/quota/providers` 查询支持情况，再调用
+`POST /v0/management/quota/fetch` 并传入 `{"auth_index":"<选中序号>"}`。
+这些接口需要 CLIProxyAPI 管理密钥。归一化后的响应包含
+`subscription.plan`、`groups[].buckets[].window`、`remainingFraction` 与 `resetTime`。
+缺失的时间窗口会被省略。非法读数会直接返回错误，不会编造零值。
+不支持配额重置。旧的插件配额路由与资源页面已移除。

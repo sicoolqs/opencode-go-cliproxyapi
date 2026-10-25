@@ -1,19 +1,19 @@
 ---
 name: Feature Request
-about: Suggest an idea or enhancement for the plugin
+about: 为插件提出想法或改进建议
 title: "[FEATURE] "
 labels: enhancement
 assignees: ''
 ---
 
-### Problem Statement
-A clear and concise description of the problem or limitation you are addressing.
+### 问题陈述
+清晰简要地描述你要解决的问题或现有局限。
 
-### Proposed Solution
-Describe the solution or feature you would like to see implemented.
+### 提议方案
+描述你希望实现的解决方案或功能。
 
-### Upstream OpenCode Go Alignment
-Does the upstream OpenCode Go API currently support this endpoint, model, or parameter? Provide references or documentation if applicable.
+### 上游 OpenCode Go 对齐情况
+上游 OpenCode Go API 是否已支持该端点、模型或参数？如有请提供引用或文档。
 
-### Alternatives Considered
-Describe any alternative solutions or workarounds you have considered.
+### 考虑过的替代方案
+描述你考虑过的其他替代方案或变通办法。

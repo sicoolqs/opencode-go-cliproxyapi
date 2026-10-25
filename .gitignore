@@ -1,0 +1,6 @@
+dist/
+plugins/
+*.h
+*.test
+*.out
+coverage.*

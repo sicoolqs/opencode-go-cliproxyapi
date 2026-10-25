@@ -1,33 +1,33 @@
-# Security Policy
+# 安全政策
 
-## Supported Versions
+## 支持的版本
 
-Only the latest release is actively supported with security updates.
+仅最新 Release 会持续提供安全更新。
 
-| Version | Supported          |
+| 版本 | 是否支持          |
 | ------- | ------------------ |
-| Latest  | :white_check_mark: |
-| < Latest| :x:                |
+| 最新版  | :white_check_mark: |
+| 旧版本| :x:                |
 
 ---
 
-## Reporting a Vulnerability
+## 报告漏洞
 
-Please do **not** report security vulnerabilities through public GitHub issues.
+请**不要**通过公开的 GitHub issue 上报安全漏洞。
 
-### How to Report
+### 上报方式
 
-1. **GitHub Private Vulnerability Reporting (Preferred):**
-   - Navigate to the **Security** tab of this repository.
-   - Click **Report a vulnerability**.
-   - Fill in the details and submit the advisory privately.
+1. **GitHub 私密漏洞上报（推荐）：**
+   - 打开本仓库的 **Security** 选项卡。
+   - 点击 **Report a vulnerability**。
+   - 填写详情并以私密 advisory 形式提交。
 
-2. **What to Include:**
-   - A description of the vulnerability and its potential impact.
-   - Exact steps or minimal payload to reproduce the issue.
-   - The CLIProxyAPI version, plugin commit/version, and operating system tested.
+2. **请包含以下信息：**
+   - 漏洞描述及其潜在影响。
+   - 可复现的精确步骤或最小 payload。
+   - 测试时使用的 CLIProxyAPI 版本、插件 commit/版本及操作系统。
 
-### What to Expect
+### 处理预期
 
-- **Acknowledgement:** We will acknowledge receipt of your report within 48 hours.
-- **Resolution:** We will investigate, prepare a fix, and coordinate release notes before public disclosure.
+- **确认收悉：** 我们将在 48 小时内确认收到你的报告。
+- **修复：** 我们会跟进调查、准备修复，并在公开披露前协调好发布说明。

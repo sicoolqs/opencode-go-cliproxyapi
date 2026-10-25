@@ -1,18 +1,18 @@
-## What's Changed
+## 本次变更
 
-### Bug Fixes
+### Bug 修复
 
-- Preserve Claude image tool results when routing to Chat Completions: retain images in an associated user message after tool replies, preserve text, tool references and error markers, and include images in session derivation. The selected upstream model must support image input.
+- 保留路由到 Chat Completions 的 Claude 图像工具结果：在工具回复后，把图片保留在关联的用户消息中，同时保留文本、工具引用与错误标记，并纳入会话推导。所选上游模型必须支持图像输入。
 
-Special thanks to @c0mm4nd in #16.
+特别感谢 @c0mm4nd 在 #16 中的贡献。
 
-- Fix `tool_result` translation when receiving `tool_reference` content blocks from Claude clients (such as ToolSearch, web search, or web fetch in Claude Code), preventing 500 errors and conversation lockouts on Chat Completions and Responses models like DeepSeek.
+- 修复收到 Claude 客户端 `tool_reference` 内容块（如 Claude Code 中的 ToolSearch、网页搜索、网页抓取）时的 `tool_result` 转换，避免在 DeepSeek 等 Chat Completions 与 Responses 模型上出现 500 错误与会话卡死。
 
-Special thanks to @SpiGAndromeda in #14.
+特别感谢 @SpiGAndromeda 在 #14 中的贡献。
 
-## Upgrade Notes
+## 升级说明
 
-- Replace the old plugin binary with the new release binary.
-- Restart CLIProxyAPI after replacing the plugin.
+- 用新版本插件二进制替换旧插件二进制。
+- 替换插件后重启 CLIProxyAPI。
 
-**Full Changelog**: https://github.com/massiveits/opencode-go-cliproxyapi/compare/v0.2.1...v0.2.2
+**完整变更记录**：https://github.com/massiveits/opencode-go-cliproxyapi/compare/v0.2.1...v0.2.2
