@@ -473,6 +473,7 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 	}
 	req.Instructions = src.System
 
+	var inline []shared.ClaudeInlineTool
 	for _, m := range src.Messages {
 		if m.Role == "system" {
 			text := m.Content
@@ -487,6 +488,14 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 					return nil, shared.SystemImageRejected()
 				case "thinking", "redacted_thinking":
 					// omitted per the FR-005 policy in the doc comment
+				case "tool_addition":
+					tool, ok, eErr := shared.ParseToolAddition(blk.Tool, src.Tools)
+					if eErr != nil {
+						return nil, eErr
+					}
+					if ok {
+						inline = append(inline, tool)
+					}
 				default:
 					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 				}
@@ -555,6 +564,25 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 
 	for _, t := range src.Tools {
 		// Claude tools carry no type field (validation cannot reject here).
+		req.Tools = append(req.Tools, shared.RespTool{
+			Type:        "function",
+			Name:        t.Name,
+			Description: t.Description,
+			Parameters:  shared.ObjectSchema(t.InputSchema),
+		})
+	}
+	seen := make(map[string]struct{}, len(req.Tools)+len(inline))
+	for _, t := range req.Tools {
+		seen[t.Name] = struct{}{}
+	}
+	for _, t := range inline {
+		// Mid-conversation tool_addition definitions merge into the top-level
+		// tools; top-level declarations win on name collision, and duplicate
+		// inline declarations keep the first (namespace-dedupe precedent).
+		if _, dup := seen[t.Name]; dup {
+			continue
+		}
+		seen[t.Name] = struct{}{}
 		req.Tools = append(req.Tools, shared.RespTool{
 			Type:        "function",
 			Name:        t.Name,

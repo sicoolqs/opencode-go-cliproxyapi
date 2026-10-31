@@ -73,6 +73,135 @@ func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, 
 // a text block, an absent system becomes a string. Non-text system content
 // is rejected descriptively, never dropped. Without system turns it is a
 // pure model rewrite with no other mutation.
+// extractSystemToolAdditions scans role=system turns for tool_addition
+// blocks (mid-conversation inline tool definitions, cf. the host
+// translator): each definition merges into the top-level Anthropic tools
+// array and the block is stripped from the turn content, so the system
+// fold below never sees it. tool_reference entries resolve against the
+// declared top-level tools. Unresolvable entries are skipped like the
+// host translator; top-level declarations win on name collision with
+// first-inline-wins for duplicates. Malformed envelopes are left for the
+// downstream kernels to reject; only well-formed tool_addition blocks are
+// consumed here.
+func extractSystemToolAdditions(req map[string]json.RawMessage) *errclass.Error {
+	rawMsgs, ok := req["messages"]
+	if !ok {
+		return nil
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(rawMsgs, &arr); err != nil {
+		return nil
+	}
+	var declared []shared.ClaudeTool
+	var toolsArr []json.RawMessage
+	if rawTools, ok := req["tools"]; ok && len(rawTools) > 0 {
+		if err := json.Unmarshal(rawTools, &toolsArr); err != nil {
+			return nil
+		}
+		for _, t := range toolsArr {
+			var dt shared.ClaudeTool
+			if err := json.Unmarshal(t, &dt); err != nil {
+				return nil
+			}
+			declared = append(declared, dt)
+		}
+	}
+	seen := make(map[string]struct{}, len(declared))
+	for _, t := range declared {
+		if t.Name != "" {
+			seen[t.Name] = struct{}{}
+		}
+	}
+	msgsChanged := false
+	toolsChanged := false
+	for i, raw := range arr {
+		var turn struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(raw, &turn); err != nil || turn.Role != "system" {
+			continue
+		}
+		var blocks []json.RawMessage
+		if err := json.Unmarshal(turn.Content, &blocks); err != nil {
+			continue // string content: nothing to extract
+		}
+		kept := make([]json.RawMessage, 0, len(blocks))
+		stripped := false
+		for _, b := range blocks {
+			var blk struct {
+				Type string          `json:"type"`
+				Tool json.RawMessage `json:"tool"`
+			}
+			if err := json.Unmarshal(b, &blk); err != nil || blk.Type != "tool_addition" {
+				kept = append(kept, b)
+				continue
+			}
+			tool, ok, eErr := shared.ParseToolAddition(blk.Tool, declared)
+			if eErr != nil {
+				return eErr
+			}
+			if !ok {
+				continue // skipped like the host translator
+			}
+			stripped = true
+			if _, dup := seen[tool.Name]; dup {
+				continue
+			}
+			seen[tool.Name] = struct{}{}
+			def := map[string]any{"name": tool.Name}
+			if tool.Description != "" {
+				def["description"] = tool.Description
+			}
+			if len(tool.InputSchema) > 0 {
+				def["input_schema"] = tool.InputSchema
+			}
+			rawDef, err := json.Marshal(def)
+			if err != nil {
+				return errclass.Translation("tool_addition definition cannot be represented as JSON")
+			}
+			toolsArr = append(toolsArr, rawDef)
+			toolsChanged = true
+			// A merged inline definition is itself resolvable by later
+			// tool_reference blocks in the same request.
+			declared = append(declared, shared.ClaudeTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema})
+		}
+		if !stripped {
+			continue
+		}
+		msgsChanged = true
+		content, err := json.Marshal(kept)
+		if err != nil {
+			return errclass.Translation("tool_addition content cannot be represented as JSON")
+		}
+		var turnMap map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &turnMap); err != nil {
+			return errclass.Translation("malformed claude request JSON: " + err.Error())
+		}
+		turnMap["content"] = content
+		updated, err := json.Marshal(turnMap)
+		if err != nil {
+			return errclass.Translation("tool_addition content cannot be represented as JSON")
+		}
+		arr[i] = updated
+	}
+	if toolsChanged {
+		merged, err := json.Marshal(toolsArr)
+		if err != nil {
+			return errclass.Translation("tool_addition tools cannot be represented as JSON")
+		}
+		req["tools"] = merged
+	}
+	if msgsChanged {
+		merged, err := json.Marshal(arr)
+		if err != nil {
+			return errclass.Translation("tool_addition content cannot be represented as JSON")
+		}
+		req["messages"] = merged
+	}
+	return nil
+}
+
 func passthroughClaude(upstreamModel string, sourceBody []byte) ([]byte, *errclass.Error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(sourceBody, &req); err != nil {
@@ -80,6 +209,11 @@ func passthroughClaude(upstreamModel string, sourceBody []byte) ([]byte, *errcla
 	}
 	if req == nil {
 		return nil, errclass.Translation("malformed request body: JSON null is not a valid request")
+	}
+	// Mid-conversation tool_addition blocks are extracted before the
+	// system fold below would reject them as unknown block types.
+	if eErr := extractSystemToolAdditions(req); eErr != nil {
+		return nil, eErr
 	}
 	rawMsgs, ok := req["messages"]
 	if !ok || !shared.HasContent(rawMsgs) {

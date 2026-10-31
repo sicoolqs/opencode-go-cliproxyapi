@@ -333,6 +333,47 @@ func TestBuildRequestClaude(t *testing.T) {
 	}
 }
 
+// Mid-conversation tool_addition blocks in system turns merge into the
+// top-level Chat Completions tools (host translator parity): inline
+// definitions append, tool_reference resolves against declared tools,
+// and unresolvable entries are skipped without failing the request.
+func TestBuildRequestClaudeSystemToolAddition(t *testing.T) {
+	body := `{"max_tokens":16,
+		"tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"system","content":[
+				{"type":"text","text":"be terse"},
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_search","description":"e","input_schema":{"type":"object"}}}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"lookup"}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"ghost"}},
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_search","description":"dup"}}}
+			]},
+			{"role":"user","content":"hi"}
+		]}`
+	m := mustBuild(t, "claude", body, nil)
+	var names []string
+	for _, tl := range m["tools"].([]any) {
+		fn := tl.(map[string]any)["function"].(map[string]any)
+		names = append(names, fn["name"].(string))
+	}
+	if fmt.Sprint(names) != "[lookup extra_search]" {
+		t.Fatalf("tools = %v, want [lookup extra_search]", names)
+	}
+	fn := m["tools"].([]any)[1].(map[string]any)["function"].(map[string]any)
+	if fn["description"] != "e" || fmt.Sprint(fn["parameters"]) != "map[type:object]" {
+		t.Fatalf("inline tool wrong: %v", fn)
+	}
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 || msgs[0].(map[string]any)["content"] != "be terse" {
+		t.Fatalf("system turn wrong: %v", msgs)
+	}
+	for _, msg := range msgs {
+		if strings.Contains(fmt.Sprint(msg), "tool_addition") {
+			t.Fatalf("tool_addition leaked into messages: %v", msg)
+		}
+	}
+}
+
 func TestBuildRequestClaudeEmptyToolSchema(t *testing.T) {
 	m := mustBuild(t, "claude", `{"tools":[{"name":"f"}],"messages":[{"role":"user","content":null}]}`, nil)
 	fn := m["tools"].([]any)[0].(map[string]any)["function"].(map[string]any)

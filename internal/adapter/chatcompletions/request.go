@@ -189,6 +189,7 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 	if src.System != "" {
 		out.Messages = append(out.Messages, ccMessage{Role: "system", Content: src.System})
 	}
+	var inline []shared.ClaudeInlineTool
 	for i := range src.Messages {
 		m := &src.Messages[i]
 		switch m.Role {
@@ -216,6 +217,14 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 					sb.WriteString(blk.Text)
 				case "image":
 					return nil, shared.SystemImageRejected()
+				case "tool_addition":
+					tool, ok, eErr := shared.ParseToolAddition(blk.Tool, src.Tools)
+					if eErr != nil {
+						return nil, eErr
+					}
+					if ok {
+						inline = append(inline, tool)
+					}
 				default:
 					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 				}
@@ -233,6 +242,23 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 		out.Tools = append(out.Tools, shared.CCTool{
 			Type:     "function",
 			Function: shared.CCFunction{Name: t.Name, Description: t.Description, Parameters: schema},
+		})
+	}
+	seen := make(map[string]struct{}, len(out.Tools)+len(inline))
+	for _, t := range out.Tools {
+		seen[t.Function.Name] = struct{}{}
+	}
+	for _, t := range inline {
+		// Mid-conversation tool_addition definitions merge into the top-level
+		// tools; top-level declarations win on name collision, and duplicate
+		// inline declarations keep the first (namespace-dedupe precedent).
+		if _, dup := seen[t.Name]; dup {
+			continue
+		}
+		seen[t.Name] = struct{}{}
+		out.Tools = append(out.Tools, shared.CCTool{
+			Type:     "function",
+			Function: shared.CCFunction{Name: t.Name, Description: t.Description, Parameters: shared.ObjectSchema(t.InputSchema)},
 		})
 	}
 	return encode(out), nil

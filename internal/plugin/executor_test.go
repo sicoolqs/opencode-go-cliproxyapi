@@ -470,6 +470,59 @@ func TestExecuteMessagesRouteNativeClaudePassesThrough(t *testing.T) {
 	}
 }
 
+// Mid-conversation tool_addition blocks merge into upstream tools on both
+// execution paths (shared buildUpstreamRequest kernel): the non-streaming
+// path and the streaming pre-first-byte path must carry the merged
+// definition and never the raw block.
+const claudeToolAdditionBody = `{"model":"x","max_tokens":16,
+	"tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"}}],
+	"messages":[
+		{"role":"system","content":[
+			{"type":"text","text":"be terse"},
+			{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_search","description":"e","input_schema":{"type":"object"}}}}
+		]},
+		{"role":"user","content":"hi"}
+	]}`
+
+func TestExecuteClaudeToolAdditionMergedNonStream(t *testing.T) {
+	m, f := newExecManager(t)
+	env := mustExecute(t, m, "opencode-go/glm-5.3", "claude", []byte(claudeToolAdditionBody))
+	if !env.OK {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	body := string(wireBody(t, lastWire(t, f, pluginabi.MethodHostHTTPDo), "body"))
+	if !strings.Contains(body, `"extra_search"`) {
+		t.Fatalf("upstream body missing merged tool: %s", body)
+	}
+	if strings.Contains(body, "tool_addition") {
+		t.Fatalf("upstream body leaks tool_addition: %s", body)
+	}
+}
+
+func TestExecuteStreamClaudeToolAdditionMerged(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		upstreamID: "up-ta",
+		frames:     []string{"data: [DONE]\n\n"},
+	})
+	resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("opencode-go/glm-5.3", "claude", []byte(claudeToolAdditionBody), "down-ta"))
+	if err != nil {
+		t.Fatalf("execute_stream: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+	streamWire := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])
+	body := string(wireBody(t, streamWire, "body"))
+	if !strings.Contains(body, `"extra_search"`) {
+		t.Fatalf("upstream stream body missing merged tool: %s", body)
+	}
+	if strings.Contains(body, "tool_addition") {
+		t.Fatalf("upstream stream body leaks tool_addition: %s", body)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+}
+
 func TestExecuteMessagesUpstreamStatusClassified(t *testing.T) {
 	f := &fakeCaller{responder: wrapWithCatalog(multiRouteCatalog, func(method string, payload []byte) ([]byte, error) {
 		if method == pluginabi.MethodHostAuthList {

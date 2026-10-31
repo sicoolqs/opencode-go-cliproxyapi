@@ -371,6 +371,61 @@ func TestUpstreamStatusError(t *testing.T) {
 	}
 }
 
+func TestParseToolAddition(t *testing.T) {
+	declared := []ClaudeTool{{Name: "lookup", Description: "d", InputSchema: json.RawMessage(`{"type":"object"}`)}}
+	tests := []struct {
+		name      string
+		tool      string
+		want      ClaudeInlineTool
+		wantOK    bool
+		wantError bool
+	}{
+		{"definition",
+			`{"type":"tool_definition","definition":{"name":"extra","description":"e","input_schema":{"type":"object"}}}`,
+			ClaudeInlineTool{Name: "extra", Description: "e", InputSchema: json.RawMessage(`{"type":"object"}`)}, true, false},
+		{"bare definition",
+			`{"definition":{"name":"extra","input_schema":{"type":"object"}}}`,
+			ClaudeInlineTool{Name: "extra", InputSchema: json.RawMessage(`{"type":"object"}`)}, true, false},
+		{"reference by name",
+			`{"type":"tool_reference","name":"lookup"}`,
+			ClaudeInlineTool{Name: "lookup", Description: "d", InputSchema: json.RawMessage(`{"type":"object"}`)}, true, false},
+		{"reference by tool_name",
+			`{"type":"tool_reference","tool_name":"lookup"}`,
+			ClaudeInlineTool{Name: "lookup", Description: "d", InputSchema: json.RawMessage(`{"type":"object"}`)}, true, false},
+		{"unknown reference skipped",
+			`{"type":"tool_reference","name":"ghost"}`, ClaudeInlineTool{}, false, false},
+		{"nameless reference skipped",
+			`{"type":"tool_reference"}`, ClaudeInlineTool{}, false, false},
+		{"empty definition name skipped",
+			`{"type":"tool_definition","definition":{"description":"e"}}`, ClaudeInlineTool{}, false, false},
+		{"missing tool skipped",
+			``, ClaudeInlineTool{}, false, false},
+		{"malformed tool",
+			`{`, ClaudeInlineTool{}, false, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok, eErr := ParseToolAddition(json.RawMessage(tc.tool), declared)
+			if tc.wantError {
+				if eErr == nil {
+					t.Fatalf("want Translation error, got %+v %t", got, ok)
+				}
+				return
+			}
+			if eErr != nil {
+				t.Fatalf("unexpected error: %v", eErr)
+			}
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %t, want %t (got %+v)", ok, tc.wantOK, got)
+			}
+			if ok && (got.Name != tc.want.Name || got.Description != tc.want.Description ||
+				string(got.InputSchema) != string(tc.want.InputSchema)) {
+				t.Fatalf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
 func equalJSON(a, b any) bool {
 	ab, _ := json.Marshal(a)
 	bb, _ := json.Marshal(b)

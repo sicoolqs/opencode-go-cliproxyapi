@@ -3,6 +3,8 @@
 ### 改进
 
 - 升级 CLIProxyAPI SDK 至 `v8.0.42`，并将上游错误响应的 `Retry-After` 指引（秒数或 HTTP-date）透传为 `retry_after_seconds`，使 CPA 认证冷却与下游重试头遵循上游提示。ABI/Schema 无变化。
+- 升级 CLIProxyAPI SDK 至 `v8.0.48`（ABI=1、Schema=9，单 provider 注册保持兼容，无需改动）。
+- 支持会话中 Claude `tool_addition` 块（与 host translator 同语义）：内联 `tool_definition` 合并为上游工具，`tool_reference` 按顶层声明解析，无法解析的条目跳过不再整单 400。覆盖 claude→chat-completions / messages / responses 三条腿，块内容不向上传输。
 
 ## 本次变更
 

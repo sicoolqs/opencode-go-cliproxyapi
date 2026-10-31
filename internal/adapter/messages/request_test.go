@@ -46,6 +46,54 @@ func TestBuildRequestUnsupportedFormat(t *testing.T) {
 	}
 }
 
+// Mid-conversation tool_addition blocks in system turns merge into the
+// top-level Anthropic tools and are stripped from the turn content, so the
+// system fold below never rejects them as unknown block types (host
+// translator parity). tool_reference resolves against declared tools;
+// unresolvable entries are skipped without failing the request.
+func TestBuildRequestClaudeSystemToolAddition(t *testing.T) {
+	body := []byte(`{"model":"opencode-go/minimax","max_tokens":10,
+		"tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"system","content":[
+				{"type":"text","text":"be terse"},
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_search","description":"e","input_schema":{"type":"object"}}}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"lookup"}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"ghost"}}
+			]},
+			{"role":"user","content":"hi"}
+		]}`)
+	out, eErr := BuildRequest("minimax", "claude", body, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	var names []string
+	for _, tl := range m["tools"].([]any) {
+		names = append(names, tl.(map[string]any)["name"].(string))
+	}
+	if len(names) != 2 || names[0] != "lookup" || names[1] != "extra_search" {
+		t.Fatalf("tools = %v, want [lookup extra_search]", names)
+	}
+	for _, tl := range m["tools"].([]any) {
+		tool := tl.(map[string]any)
+		if _, ok := tool["input_schema"]; !ok {
+			t.Fatalf("input_schema lost: %v", tool)
+		}
+		if strings.Contains(strings.ToLower(fmt.Sprint(tool)), "tool_addition") {
+			t.Fatalf("tool_addition leaked into tools: %v", tool)
+		}
+	}
+	if m["system"] != "be terse" {
+		t.Fatalf("system = %v, want %q", m["system"], "be terse")
+	}
+	for _, msg := range m["messages"].([]any) {
+		if strings.Contains(fmt.Sprint(msg), "tool_addition") {
+			t.Fatalf("tool_addition leaked into messages: %v", msg)
+		}
+	}
+}
+
 func TestBuildRequestClaude(t *testing.T) {
 	body := []byte(`{"model":"opencode-go/minimax","max_tokens":10,"system":"s","stream":true}`)
 	out, eErr := BuildRequest("minimax", "claude", []byte(body), nil)

@@ -1355,7 +1355,7 @@ func ThinkingEnabled(t *ClaudeThinking) bool {
 // through ClaudeImageURL; tool_use Input and tool_result Result stay raw
 // so each target renderer applies its own vocabulary and policies.
 type ClaudeBlock struct {
-	Kind    string          // text, image, tool_use, tool_result, thinking, redacted_thinking, or an unknown wire type
+	Kind    string          // text, image, tool_use, tool_result, tool_addition, thinking, redacted_thinking, or an unknown wire type
 	Text    string          // text blocks
 	URL     string          // image blocks: resolved http(s)/data URL
 	CallID  string          // tool_use "id" / tool_result "tool_use_id"
@@ -1363,6 +1363,7 @@ type ClaudeBlock struct {
 	Input   json.RawMessage // tool_use arguments (absent → nil)
 	Result  json.RawMessage // tool_result payload (string or block array)
 	IsError bool            // tool_result is_error flag
+	Tool    json.RawMessage // tool_addition "tool" wrapper (definition or reference)
 }
 
 // ClaudeMessageRecord is one Anthropic Messages message turn: Content is
@@ -1416,6 +1417,7 @@ type claudeWireBlock struct {
 	ToolUseID string          `json:"tool_use_id"`
 	Content   json.RawMessage `json:"content"` // tool_result payload: string or blocks
 	IsError   bool            `json:"is_error"`
+	Tool      json.RawMessage `json:"tool"` // tool_addition wrapper: definition or reference
 }
 
 // DecodeClaudeMessages decodes an inbound Anthropic Messages request body
@@ -1500,6 +1502,7 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 			Kind: wb.Type, Text: wb.Text,
 			Name: wb.Name, Input: wb.Input,
 			Result: wb.Content, IsError: wb.IsError,
+			Tool: wb.Tool,
 		}
 		switch wb.Type {
 		case "image":
@@ -1519,6 +1522,68 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 		blocks = append(blocks, blk)
 	}
 	return blocks, nil
+}
+
+// ClaudeInlineTool is one tool definition carried inline by a Claude
+// tool_addition block (decode-only): either embedded directly or resolved
+// from a tool_reference against the request's top-level tools.
+type ClaudeInlineTool struct {
+	Name        string
+	Description string
+	InputSchema json.RawMessage
+}
+
+// ParseToolAddition resolves a tool_addition block's "tool" wrapper into a
+// tool definition, mirroring the host translator (mid-conversation inline
+// tool definitions). The wrapper carries either an embedded definition
+// ({"type":"tool_definition","definition":{name,description,input_schema}}
+// or a bare {"definition":{...}}) or a reference to a top-level declared
+// tool ({"type":"tool_reference","name"|"tool_name":...}). It reports false
+// when the block carries no usable definition — an unresolvable reference
+// or an empty name is skipped like the host translator instead of failing
+// the whole request. A "tool" value that is not a JSON object is a
+// translation failure; callers strip consumed blocks from the content.
+func ParseToolAddition(rawTool json.RawMessage, declared []ClaudeTool) (ClaudeInlineTool, bool, *errclass.Error) {
+	if len(rawTool) == 0 {
+		return ClaudeInlineTool{}, false, nil
+	}
+	var wrapper struct {
+		Type       string          `json:"type"`
+		Definition json.RawMessage `json:"definition"`
+		Name       string          `json:"name"`
+		ToolName   string          `json:"tool_name"`
+	}
+	if err := json.Unmarshal(rawTool, &wrapper); err != nil {
+		return ClaudeInlineTool{}, false, errclass.Translation("malformed tool_addition tool: " + err.Error())
+	}
+	def := wrapper.Definition
+	if wrapper.Type == "tool_reference" || (wrapper.Type != "tool_definition" && len(def) == 0) {
+		refName := wrapper.Name
+		if refName == "" {
+			refName = wrapper.ToolName
+		}
+		if refName == "" {
+			return ClaudeInlineTool{}, false, nil
+		}
+		for _, t := range declared {
+			if t.Name == refName {
+				return ClaudeInlineTool{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema}, true, nil
+			}
+		}
+		return ClaudeInlineTool{}, false, nil
+	}
+	var tool struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		InputSchema json.RawMessage `json:"input_schema"`
+	}
+	if err := json.Unmarshal(def, &tool); err != nil {
+		return ClaudeInlineTool{}, false, errclass.Translation("malformed tool_addition definition: " + err.Error())
+	}
+	if strings.TrimSpace(tool.Name) == "" {
+		return ClaudeInlineTool{}, false, nil
+	}
+	return ClaudeInlineTool{Name: tool.Name, Description: tool.Description, InputSchema: tool.InputSchema}, true, nil
 }
 
 // OpenAIImageURL extracts the image URL from an OpenAI-style content part:

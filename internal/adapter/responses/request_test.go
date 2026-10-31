@@ -648,6 +648,40 @@ func TestResponsesEffortMapping(t *testing.T) {
 	}
 }
 
+// Mid-conversation tool_addition blocks in system turns merge into the
+// top-level Responses tools (host translator parity): inline definitions
+// append, tool_reference resolves against declared tools, and
+// unresolvable entries are skipped without failing the request.
+func TestClaudeSystemToolAddition(t *testing.T) {
+	body := `{"max_tokens":16,
+		"tools":[{"name":"lookup","description":"d","input_schema":{"type":"object"}}],
+		"messages":[
+			{"role":"system","content":[
+				{"type":"text","text":"be terse"},
+				{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"extra_search","description":"e","input_schema":{"type":"object"}}}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"lookup"}},
+				{"type":"tool_addition","tool":{"type":"tool_reference","name":"ghost"}}
+			]},
+			{"role":"user","content":"hi"}
+		]}`
+	m := decodeReq(t, mustBuild(t, "m", "claude", []byte(body), nil))
+	var names []string
+	for _, tl := range m["tools"].([]any) {
+		names = append(names, tl.(map[string]any)["name"].(string))
+	}
+	if fmt.Sprint(names) != "[lookup extra_search]" {
+		t.Fatalf("tools = %v, want [lookup extra_search]", names)
+	}
+	extra := m["tools"].([]any)[1].(map[string]any)
+	if extra["type"] != "function" || extra["description"] != "e" ||
+		fmt.Sprint(extra["parameters"]) != "map[type:object]" {
+		t.Fatalf("inline tool wrong: %v", extra)
+	}
+	if m["instructions"] != "be terse" {
+		t.Fatalf("instructions = %v, want %q", m["instructions"], "be terse")
+	}
+}
+
 func TestClaudeImageDefaultMediaType(t *testing.T) {
 	body := `{"max_tokens":16,"messages":[{"role":"user","content":[
 		{"type":"image","source":{"type":"base64","data":"QQ=="}}]}]}`
