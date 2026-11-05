@@ -906,11 +906,14 @@ func TestUnroutableModelExcludedWithDiagnostic(t *testing.T) {
 		t.Fatal("routable model missing")
 	}
 	blob := logBlobOf(f)
-	if !strings.Contains(blob, "unsupported models excluded") || !strings.Contains(blob, "weird-unknown-9x") {
+	if !strings.Contains(blob, "excluded from the routable catalog") || !strings.Contains(blob, "weird-unknown-9x") {
 		t.Fatalf("diagnostic log missing: %s", blob)
 	}
-	if !strings.Contains(blob, `"warnings"`) || !strings.Contains(blob, "duplicate model") {
-		t.Fatalf("warnings field missing from diagnostic: %s", blob)
+	if !strings.Contains(blob, `"kind":"unroutable-model"`) || !strings.Contains(blob, `"reason":"no route determined"`) {
+		t.Fatalf("structured diagnostic fields missing: %s", blob)
+	}
+	if !strings.Contains(blob, "duplicate model") {
+		t.Fatalf("duplicate diagnostic missing: %s", blob)
 	}
 }
 

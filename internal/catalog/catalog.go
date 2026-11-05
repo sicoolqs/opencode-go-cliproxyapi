@@ -228,6 +228,10 @@ type Manager struct {
 	index map[string]ModelRecord
 	unsup []UnsupportedModel
 	warns []string
+	// diags is the structured form of warns+unsup; diagSeen tracks the
+	// diagnostics already logged so repeated refreshes stay quiet.
+	diags    []Diagnostic
+	diagSeen map[string]struct{}
 }
 
 // New returns a Manager serving cfg through the host client.
@@ -293,12 +297,14 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 		return m.fail("invalid json")
 	}
 	var rawEntries []json.RawMessage
-	var warns []string
+	var extra []Diagnostic
 	if env.Data == nil {
 		// Key ABSENCE is upstream shape drift, never an intended clear:
 		// clear like an empty plan (swap(nil)) but leave a diagnostic.
 		// A present-but-empty array stays silent (tested-intended state).
-		warns = append(warns, `upstream catalog response missing "data" field`)
+		extra = append(extra, shapeDiagnostic(
+			`catalog: upstream catalog response missing "data" field; impact: the routable catalog was cleared until the next successful refresh`,
+			"catalog-cleared"))
 	} else if err := json.Unmarshal(env.Data, &rawEntries); err != nil {
 		return m.fail("invalid json")
 	}
@@ -308,13 +314,15 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			// One malformed entry must not blank the whole catalog: keep the
 			// snapshot and report it, mirroring the per-entry diagnostics.
-			warns = append(warns, "catalog entry is not a JSON object and was skipped")
+			extra = append(extra, shapeDiagnostic(
+				"catalog: one catalog entry is not a JSON object and was skipped; impact: that entry is not published",
+				"entry-not-published"))
 			continue
 		}
 		entry.Raw = append(json.RawMessage(nil), raw...)
 		entries = append(entries, entry)
 	}
-	m.swap(entries, warns...)
+	m.swap(entries, extra...)
 	return nil
 }
 
@@ -326,7 +334,8 @@ func (m *Manager) fail(category string) error {
 		// Clear the index too — Lookup must stop resolving IDs whose
 		// records are gone (FR-002). Raw entries go with them: a cleared
 		// snapshot has nothing to seed.
-		m.raw, m.models, m.index, m.unsup, m.warns = nil, nil, nil, nil, nil
+		m.raw, m.models, m.index, m.unsup, m.warns, m.diags = nil, nil, nil, nil, nil, nil
+		m.diagSeen = nil
 	}
 	return fmt.Errorf("catalog refresh failed: %s", category)
 }
@@ -335,33 +344,31 @@ func (m *Manager) fail(category string) error {
 // atomically under the mutex (FR-010 dedup, arch §5 route priority).
 // extraWarns are caller-supplied snapshot diagnostics (e.g. decode-level
 // shape-drift notices) recorded alongside the per-entry ones.
-func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
+func (m *Manager) swap(entries []rawModel, extra ...Diagnostic) {
 	models := make([]ModelRecord, 0, len(entries))
 	index := make(map[string]ModelRecord, len(entries)*2)
-	var unsup []UnsupportedModel
-	var warns []string
-	warns = append(warns, extraWarns...)
+	diags := append([]Diagnostic(nil), extra...)
 	seen := make(map[string]bool, len(entries))
 	for _, e := range entries {
 		if e.ID == "" {
-			unsup = append(unsup, UnsupportedModel{Reason: "missing id"})
+			diags = append(diags, missingIDDiagnostic())
 			continue
 		}
 		if seen[e.ID] {
-			warns = append(warns, fmt.Sprintf("duplicate model %q ignored; keeping first occurrence", e.ID))
+			diags = append(diags, duplicateDiagnostic(e.ID))
 			continue
 		}
 		seen[e.ID] = true
-		route, endpoint, ok, warn := m.resolve(e)
-		if warn != "" {
-			warns = append(warns, warn)
+		route, endpoint, ok, diag := m.resolve(e)
+		if diag != nil && diag.Kind != DiagUnroutable {
+			diags = append(diags, *diag)
 		}
 		if !ok {
-			reason := warn
-			if reason == "" {
-				reason = "no route determined"
+			if diag != nil {
+				diags = append(diags, *diag)
+			} else {
+				diags = append(diags, unroutableDiagnostic(e.ID, "", "no route determined"))
 			}
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
 			continue
 		}
 		inputModes := firstNonEmpty(e.InputModes, e.InputModalities)
@@ -409,13 +416,13 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			if !protocolEnabled(m.cfg, rec.NativeProtocol) {
 				reason = fmt.Sprintf("protocol %s disabled by config", rec.NativeProtocol)
 			}
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+			diags = append(diags, unroutableDiagnostic(e.ID, rec.NativeProtocol, reason))
 			continue
 		}
 		if !IsTextProtocol(rec.NativeProtocol) {
-			warns = append(warns, fmt.Sprintf(
-				"model %q declares native generate-content (%s) without a transport; defaulting to %s",
-				e.ID, rec.NativeProtocol, defaultProto))
+			// The catalog cannot know which text protocol a request will use;
+			// the routing policy decides that per request.
+			diags = append(diags, googleFallbackDiagnostic(e.ID))
 		}
 		rec.Protocol = defaultProto
 		if endpoint == "" {
@@ -424,7 +431,7 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 		rec.EndpointPath = endpoint
 		url, eErr := EndpointURL(m.cfg, rec, defaultProto)
 		if eErr != nil {
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: eErr.Message})
+			diags = append(diags, unroutableDiagnostic(e.ID, rec.NativeProtocol, eErr.Message))
 			continue
 		}
 		rec.EndpointURL = url
@@ -438,23 +445,31 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 		// role, and a record's own public==upstream rewrite is not a clash.
 		if other, ok := index[rec.PublicID]; ok {
 			reason := fmt.Sprintf("public id %q collides with upstream id %q", rec.PublicID, other.UpstreamID)
-			warns = append(warns, reason)
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+			diags = append(diags, collisionDiagnostic(e.ID, reason))
 			continue
 		}
 		if other, ok := index[rec.UpstreamID]; ok {
 			reason := fmt.Sprintf("public id %q collides with upstream id %q", other.PublicID, rec.UpstreamID)
-			warns = append(warns, reason)
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+			diags = append(diags, collisionDiagnostic(e.ID, reason))
 			continue
 		}
 		models = append(models, rec)
 		index[rec.PublicID] = rec
 		index[rec.UpstreamID] = rec
 	}
+	warns := make([]string, 0, len(diags))
+	unsup := make([]UnsupportedModel, 0, len(diags))
+	for _, d := range diags {
+		warns = append(warns, d.Message)
+		// Unsupported() is the compatibility view of every excluded model:
+		// both plain unroutable entries and id collisions are exclusions.
+		if d.Kind == DiagUnroutable || d.Kind == DiagIDCollision {
+			unsup = append(unsup, UnsupportedModel{UpstreamID: d.ModelID, Reason: d.Reason})
+		}
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.raw, m.models, m.index, m.unsup, m.warns = entries, models, index, unsup, warns
+	m.raw, m.models, m.index, m.unsup, m.warns, m.diags = entries, models, index, unsup, warns, diags
 }
 
 // protocolEnabled reports whether the resolved route's protocol flag is on
@@ -475,32 +490,45 @@ func (m *Manager) protocolEnabled(r Route) bool {
 
 // resolve applies route priority strictly: user override, the catalog's
 // authoritative api field, then the legacy compatibility table (family
-// prefix) for catalogs that predate the api field.
-func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
+// prefix) for catalogs that predate the api field. The returned diagnostic
+// is informational for overrides and unroutable for unsupported catalogs;
+// a nil diagnostic with ok=false means "no route determined".
+func (m *Manager) resolve(e rawModel) (Route, string, bool, *Diagnostic) {
 	if o, ok := m.cfg.RouteOverrides[e.ID]; ok {
 		// Spec 04 §5: an override MUST be visible in diagnostics. Load
 		// validation (spec 04 §6) guarantees a known protocol, so the
 		// map lookup above is the only decision point here.
-		return Route(o.Protocol), o.Endpoint, true, fmt.Sprintf(
-			"model %q routed via user override (%s %s)", e.ID, o.Protocol, o.Endpoint)
+		diag := routeOverrideDiagnostic(e.ID, nativeProtocolFromAPI(e.API), Route(o.Protocol), o.Endpoint)
+		return Route(o.Protocol), o.Endpoint, true, &diag
 	}
 	if len(e.API) > 0 {
 		for _, p := range apiProtocolOrder {
 			if _, ok := e.API[p.key]; ok {
-				return p.route, "", true, ""
+				return p.route, "", true, nil
 			}
 		}
-		return "", "", false, fmt.Sprintf(
-			"model %q declares no supported api protocol (got %s)",
-			e.ID, strings.Join(sortedKeys(e.API), ", "))
+		reason := fmt.Sprintf("no supported api protocol (got %s)", strings.Join(sortedKeys(e.API), ", "))
+		diag := unroutableDiagnostic(e.ID, "", reason)
+		return "", "", false, &diag
 	}
 	id := strings.ToLower(e.ID)
 	for _, p := range prefixRoutes {
 		if strings.HasPrefix(id, p.prefix) {
-			return p.route, "", true, ""
+			return p.route, "", true, nil
 		}
 	}
-	return "", "", false, ""
+	return "", "", false, nil
+}
+
+// nativeProtocolFromAPI returns the catalog-declared native protocol for
+// diagnostics, or "" when the entry carries no api map.
+func nativeProtocolFromAPI(api map[string]rawAPI) Route {
+	for _, p := range apiProtocolOrder {
+		if _, ok := api[p.key]; ok {
+			return p.route
+		}
+	}
+	return ""
 }
 
 // supportedProtocolsFromAPI maps a catalog api map to protocol values in
@@ -647,11 +675,42 @@ func (m *Manager) Unsupported() []UnsupportedModel {
 	return out
 }
 
-// Warnings returns dedup and override diagnostics.
+// Warnings returns the human-readable message of every catalog diagnostic
+// (info and warn) for compatibility with callers that predate the structured
+// Diagnostics view.
 func (m *Manager) Warnings() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]string, len(m.warns))
 	copy(out, m.warns)
 	return out
+}
+
+// Diagnostics returns the current structured catalog diagnostics.
+func (m *Manager) Diagnostics() []Diagnostic {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Diagnostic, len(m.diags))
+	copy(out, m.diags)
+	return out
+}
+
+// FreshDiagnostics returns only diagnostics whose kind/model/message were not
+// present at the previous call, then records the current set. Unchanged
+// diagnostics stay quiet across refreshes; a diagnostic that disappears and
+// later reappears is new again.
+func (m *Manager) FreshDiagnostics() []Diagnostic {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := make(map[string]struct{}, len(m.diags))
+	fresh := make([]Diagnostic, 0, len(m.diags))
+	for _, d := range m.diags {
+		key := d.Key()
+		current[key] = struct{}{}
+		if _, ok := m.diagSeen[key]; !ok {
+			fresh = append(fresh, d)
+		}
+	}
+	m.diagSeen = current
+	return fresh
 }

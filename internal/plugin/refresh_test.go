@@ -129,7 +129,7 @@ func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	}
 	logCalls := rec.logCalls()
 	if len(logCalls) != 1 {
-		t.Fatalf("host.log calls = %d, want exactly one unsupported-models warn", len(logCalls))
+		t.Fatalf("host.log calls = %d, want exactly one unroutable-model warn", len(logCalls))
 	}
 	var req struct {
 		Level   string         `json:"level"`
@@ -139,14 +139,23 @@ func TestRefreshUnsupportedLogQuotesNewlineIDs(t *testing.T) {
 	if err := json.Unmarshal(logCalls[0], &req); err != nil {
 		t.Fatalf("decode host.log payload: %v", err)
 	}
-	if req.Message != "unsupported models excluded from routable catalog" {
+	if req.Level != "warn" {
+		t.Fatalf("level = %q, want warn", req.Level)
+	}
+	if !strings.Contains(req.Message, "excluded from the routable catalog") {
 		t.Fatalf("unexpected log message: %q", req.Message)
 	}
-	modelsField, _ := req.Fields["models"].(string)
-	if strings.ContainsRune(modelsField, '\n') {
-		t.Fatalf("models log field contains raw newline (log injection): %q", modelsField)
+	if strings.ContainsRune(req.Message, '\n') {
+		t.Fatalf("message contains raw newline (log injection): %q", req.Message)
 	}
-	if want := fmt.Sprintf("%q: ", evilID); !strings.Contains(modelsField, want) {
-		t.Fatalf("models field must quote the upstream ID; got %q, want prefix %q", modelsField, want)
+	if want := fmt.Sprintf("%q", evilID); !strings.Contains(req.Message, want) {
+		t.Fatalf("message must quote the upstream ID; got %q, want %q", req.Message, want)
+	}
+	modelField, _ := req.Fields["model"].(string)
+	if strings.ContainsRune(modelField, '\n') {
+		t.Fatalf("model log field contains raw newline (log injection): %q", modelField)
+	}
+	if modelField != fmt.Sprintf("%q", evilID) {
+		t.Fatalf("model field = %q, want quoted upstream id", modelField)
 	}
 }

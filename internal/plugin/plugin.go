@@ -565,23 +565,33 @@ func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridg
 		}
 		return err
 	}
-	// FR-010: surface normalization diagnostics with the post-refresh log.
-	warnings := mgr.Warnings()
-	if uns := mgr.Unsupported(); len(uns) > 0 {
-		parts := make([]string, len(uns))
-		for i, u := range uns {
-			parts[i] = fmt.Sprintf("%q: %s", u.UpstreamID, u.Reason)
-		}
-		fields := map[string]any{"models": strings.Join(parts, ", ")}
-		if len(warnings) > 0 {
-			fields["warnings"] = strings.Join(warnings, "; ")
-		}
-		_ = bridge.Log("warn", "unsupported models excluded from routable catalog", fields)
-	} else if len(warnings) > 0 {
-		_ = bridge.Log("warn", "catalog normalization warnings",
-			map[string]any{"warnings": strings.Join(warnings, "; ")})
-	}
+	// FR-010: surface every catalog diagnostic individually with its own
+	// level, so Docker's default output names the model, cause and impact
+	// instead of a generic summary. Unchanged diagnostics are suppressed by
+	// the catalog's change tracking.
+	logCatalogDiagnostics(mgr, bridge)
 	return nil
+}
+
+// logCatalogDiagnostics forwards each new catalog diagnostic to host.log at
+// its own level. The message carries the full explanation; fields keep the
+// structured attributes for search.
+func logCatalogDiagnostics(mgr *catalog.Manager, bridge *HostBridge) {
+	if bridge == nil {
+		return
+	}
+	for _, d := range mgr.FreshDiagnostics() {
+		fields := make(map[string]any, len(d.Fields)+1)
+		for k, v := range d.Fields {
+			fields[k] = v
+		}
+		fields["kind"] = string(d.Kind)
+		level := d.Level
+		if level == "" {
+			level = "warn"
+		}
+		_ = bridge.Log(level, d.Message, fields)
+	}
 }
 
 func okEnvelope(result any) []byte {

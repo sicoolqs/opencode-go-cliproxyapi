@@ -732,7 +732,7 @@ func TestOverrideApplicationRecordedInWarnings(t *testing.T) {
 
 	warns := m.Warnings()
 	if len(warns) != 1 || !strings.Contains(warns[0], `model "weird-model" routed via user override`) ||
-		!strings.Contains(warns[0], "chat-completions /v1/custom") {
+		!strings.Contains(warns[0], "chat-completions") || !strings.Contains(warns[0], "/v1/custom") {
 		t.Fatalf("override warning wrong: %+v", warns)
 	}
 }
@@ -1057,12 +1057,12 @@ func TestSwapPublicUpstreamCrossKeyCollision(t *testing.T) {
 			}
 			foundWarn := false
 			for _, w := range m.Warnings() {
-				if w == wantMsg {
+				if strings.Contains(w, wantMsg) {
 					foundWarn = true
 				}
 			}
 			if !foundWarn {
-				t.Fatalf("warnings = %v, want %q", m.Warnings(), wantMsg)
+				t.Fatalf("warnings = %v, want a message containing %q", m.Warnings(), wantMsg)
 			}
 			unsup := m.Unsupported()
 			if len(unsup) != 1 || unsup[0].UpstreamID != ids[1] || unsup[0].Reason != wantMsg {
@@ -1097,12 +1097,12 @@ func TestRefreshDataKeyAbsentVsEmpty(t *testing.T) {
 	}
 	found := false
 	for _, w := range m.Warnings() {
-		if w == driftWarn {
+		if strings.Contains(w, driftWarn) {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("warnings = %v, want %q", m.Warnings(), driftWarn)
+		t.Fatalf("warnings = %v, want a message containing %q", m.Warnings(), driftWarn)
 	}
 
 	// Key present but empty array: intended clear, no warning.
