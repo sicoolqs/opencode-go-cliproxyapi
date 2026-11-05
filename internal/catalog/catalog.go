@@ -69,11 +69,21 @@ func routeFromString(s string) (Route, bool) {
 
 // ModelRecord is one routable normalized catalog entry (arch §7, FR-003).
 type ModelRecord struct {
-	PublicID     string
-	UpstreamID   string
-	DisplayName  string
-	Protocol     Route
-	EndpointPath string
+	PublicID    string
+	UpstreamID  string
+	DisplayName string
+	// Protocol is the compatibility field: the protocol used when no
+	// per-request routing applies (native when it has a transport).
+	Protocol Route
+	// NativeProtocol is the protocol declared by the catalog.
+	NativeProtocol Route
+	// SupportedProtocols lists the protocols the catalog declares for the
+	// model (its api map), used for capability checks.
+	SupportedProtocols []Route
+	// FromConsoleCatalog reports that the entry declared an api map, which
+	// carries the gateway's cross-API translation guarantee.
+	FromConsoleCatalog bool
+	EndpointPath       string
 	// EndpointURL is the full per-protocol upstream URL from config. Empty
 	// when the snapshot was built from a config without endpoints (tests and
 	// legacy direct construction); callers then fall back to
@@ -354,49 +364,6 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
 			continue
 		}
-		if route == RouteGoogle {
-			// No native Gemini transport in this plugin. Console translates
-			// every text model across its APIs, so serve the model through
-			// chat-completions and say so instead of dropping it silently.
-			if !m.cfg.Protocols.Google {
-				unsup = append(unsup, UnsupportedModel{
-					UpstreamID: e.ID,
-					Reason:     "protocol google disabled by config",
-				})
-				continue
-			}
-			warns = append(warns, fmt.Sprintf(
-				"model %q declares native generate-content; served via chat-completions because no native Google transport is implemented",
-				e.ID))
-			route = RouteChatCompletions
-			endpoint = ""
-		}
-		if !m.protocolEnabled(route) {
-			// Flags apply at snapshot build; a stale snapshot kept per
-			// FR-002 reflects the flags it was built with until the next
-			// successful refresh.
-			unsup = append(unsup, UnsupportedModel{
-				UpstreamID: e.ID,
-				Reason:     fmt.Sprintf("protocol %s disabled by config", route),
-			})
-			continue
-		}
-		if endpoint != "" && endpointEscapesBase(m.cfg.BaseURL, endpoint) {
-			// The joined URL must stay on the configured upstream
-			// authority. Override endpoints flow through here, so they
-			// cannot rewrite the URL host — e.g. "/v1@evil.com/x"
-			// against a bare-host base-url turns the base into userinfo
-			// and would send credentials/prompts to an attacker host
-			// (spec 05 §2 trust boundary).
-			unsup = append(unsup, UnsupportedModel{
-				UpstreamID: e.ID,
-				Reason:     "resolved endpoint escapes the configured upstream host",
-			})
-			continue
-		}
-		if endpoint == "" {
-			endpoint = route.EndpointPath()
-		}
 		inputModes := firstNonEmpty(e.InputModes, e.InputModalities)
 		outputModes := firstNonEmpty(e.OutputModes, e.OutputModalities)
 		if e.Modalities != nil {
@@ -414,19 +381,53 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			}
 		}
 		rec := ModelRecord{
-			PublicID:     config.PublicID(m.cfg, e.ID),
-			UpstreamID:   e.ID,
-			DisplayName:  display,
-			Protocol:     route,
-			EndpointPath: endpoint,
-			EndpointURL:  m.endpointURL(route, e.ID),
-			ContextLimit: contextLimit,
-			OutputLimit:  outputLimit,
-			InputModes:   inputModes,
-			OutputModes:  outputModes,
-			Thinking:     normalizeThinking(e.Thinking, e.Capabilities),
-			Raw:          e.Raw,
+			PublicID:           config.PublicID(m.cfg, e.ID),
+			UpstreamID:         e.ID,
+			DisplayName:        display,
+			Protocol:           route, // compatibility field; see NativeProtocol
+			NativeProtocol:     route,
+			SupportedProtocols: supportedProtocolsFromAPI(e.API),
+			FromConsoleCatalog: len(e.API) > 0,
+			EndpointPath:       endpoint,
+			ContextLimit:       contextLimit,
+			OutputLimit:        outputLimit,
+			InputModes:         inputModes,
+			OutputModes:        outputModes,
+			Thinking:           normalizeThinking(e.Thinking, e.Capabilities),
+			Raw:                e.Raw,
 		}
+		// A model stays routable while at least one enabled protocol can serve
+		// it. Protocol switches no longer hide models whose native protocol
+		// happens to be disabled: a Console text model remains reachable
+		// through the other APIs.
+		defaultProto, routable := firstUsable(m.cfg, rec)
+		if !routable {
+			reason := fmt.Sprintf(
+				"no usable upstream protocol (native %s; chat=%t messages=%t responses=%t)",
+				rec.NativeProtocol, m.cfg.Protocols.ChatCompletions,
+				m.cfg.Protocols.Messages, m.cfg.Protocols.Responses)
+			if !protocolEnabled(m.cfg, rec.NativeProtocol) {
+				reason = fmt.Sprintf("protocol %s disabled by config", rec.NativeProtocol)
+			}
+			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
+			continue
+		}
+		if !IsTextProtocol(rec.NativeProtocol) {
+			warns = append(warns, fmt.Sprintf(
+				"model %q declares native generate-content (%s) without a transport; defaulting to %s",
+				e.ID, rec.NativeProtocol, defaultProto))
+		}
+		rec.Protocol = defaultProto
+		if endpoint == "" {
+			endpoint = defaultProto.EndpointPath()
+		}
+		rec.EndpointPath = endpoint
+		url, eErr := EndpointURL(m.cfg, rec, defaultProto)
+		if eErr != nil {
+			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: eErr.Message})
+			continue
+		}
+		rec.EndpointURL = url
 		// With a prefix enabled, one record's PublicID can equal another
 		// record's UpstreamID (upstream "foo" and "opencode-go/foo" both
 		// claim index key "<prefix>/foo"); last-write-wins would silently
@@ -502,24 +503,19 @@ func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
 	return "", "", false, ""
 }
 
-// endpointURL returns the configured full URL for the route. Empty means the
-// config carried no per-protocol endpoints (legacy direct construction) and
-// callers fall back to JoinUpstreamURL.
-func (m *Manager) endpointURL(r Route, upstreamID string) string {
-	switch r {
-	case RouteChatCompletions:
-		return m.cfg.Endpoints.ChatCompletions
-	case RouteMessages:
-		return m.cfg.Endpoints.Messages
-	case RouteResponses:
-		return m.cfg.Endpoints.Responses
-	case RouteGoogle:
-		if m.cfg.Endpoints.Google == "" {
-			return ""
-		}
-		return strings.TrimRight(m.cfg.Endpoints.Google, "/") + "/models/" + upstreamID + ":generateContent"
+// supportedProtocolsFromAPI maps a catalog api map to protocol values in
+// deterministic order. Legacy entries without api yield nil.
+func supportedProtocolsFromAPI(api map[string]rawAPI) []Route {
+	if len(api) == 0 {
+		return nil
 	}
-	return ""
+	out := make([]Route, 0, len(api))
+	for _, p := range apiProtocolOrder {
+		if _, ok := api[p.key]; ok {
+			out = append(out, p.route)
+		}
+	}
+	return out
 }
 
 // sortedKeys returns map keys in a stable order for diagnostics.

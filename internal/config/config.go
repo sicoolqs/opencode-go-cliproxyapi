@@ -64,6 +64,29 @@ type Catalog struct {
 	StaleWhileUnavailable bool
 }
 
+// RoutingMode selects how the upstream protocol is chosen per request.
+type RoutingMode string
+
+const (
+	// RoutingNative always uses the model's native protocol (pre-change
+	// behavior; the default so upgrades stay compatible).
+	RoutingNative RoutingMode = "native"
+	// RoutingPreferClient uses the client protocol when the model can speak
+	// it, falling back to the native protocol when translation is allowed.
+	RoutingPreferClient RoutingMode = "prefer-client-protocol"
+	// RoutingAnthropic routes every capable model through Anthropic Messages
+	// (Claude Code deployments).
+	RoutingAnthropic RoutingMode = "anthropic"
+)
+
+// Routing holds the protocol routing policy.
+type Routing struct {
+	Mode RoutingMode
+	// AllowTranslation permits falling back to the native protocol when the
+	// client protocol cannot be served for the model.
+	AllowTranslation bool
+}
+
 type Protocols struct {
 	ChatCompletions bool
 	Messages        bool
@@ -92,6 +115,7 @@ type Config struct {
 	APIKeys          []APIKey
 	Catalog          Catalog
 	Protocols        Protocols
+	Routing          Routing
 	RouteOverrides   map[string]RouteOverride
 	AllowHTTP        bool
 	RequestTimeout   time.Duration
@@ -113,6 +137,7 @@ type rawConfig struct {
 	APIKeys            []rawKey                 `yaml:"api-keys"`
 	Catalog            rawCatalog               `yaml:"catalog"`
 	Protocols          rawProtocols             `yaml:"protocols"`
+	Routing            rawRouting               `yaml:"routing"`
 	RouteOverrides     map[string]RouteOverride `yaml:"route-overrides"`
 	AllowHTTP          bool                     `yaml:"allow-http"`
 	RequestTimeout     *string                  `yaml:"request-timeout"`
@@ -139,6 +164,11 @@ type rawProtocols struct {
 	Messages        *bool `yaml:"messages"`
 	Responses       *bool `yaml:"responses"`
 	Google          *bool `yaml:"google"`
+}
+
+type rawRouting struct {
+	Mode             *string `yaml:"mode"`
+	AllowTranslation *bool   `yaml:"allow-translation"`
 }
 
 var (
@@ -194,6 +224,10 @@ func Load(yamlBytes []byte) (Config, error) {
 		AllowHTTP:        raw.AllowHTTP,
 		RequestTimeout:   requestTimeout,
 		MaxResponseBytes: orDefault(raw.MaxResponseBytes, DefaultMaxResponseBytes),
+		Routing: Routing{
+			Mode:             RoutingMode(orDefault(raw.Routing.Mode, string(RoutingNative))),
+			AllowTranslation: orDefault(raw.Routing.AllowTranslation, true),
+		},
 	}
 	// Endpoint layout: an explicit base-url selects the legacy
 	// single-base layout (/zen/go/v1 style) for backward compatibility;
@@ -311,6 +345,14 @@ func (c Config) validate() error {
 	}
 	if c.ModelPrefix.Enabled && !validPrefix(c.ModelPrefix.Value) {
 		return fmt.Errorf("model-prefix.value: invalid provider-ID characters %q", c.ModelPrefix.Value)
+	}
+	switch c.Routing.Mode {
+	case RoutingNative, RoutingPreferClient, RoutingAnthropic:
+	default:
+		return fmt.Errorf("routing.mode: unsupported mode %q", c.Routing.Mode)
+	}
+	if c.Routing.Mode == RoutingAnthropic && !c.Protocols.Messages {
+		return fmt.Errorf("routing.mode anthropic requires protocols.messages enabled")
 	}
 	return nil
 }

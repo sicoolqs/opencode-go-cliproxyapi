@@ -116,4 +116,25 @@ func TestLiveCatalogParsesIntoRoutableRecords(t *testing.T) {
 		}
 	}
 	t.Logf("routable=%d unsupported=%d warnings=%d", len(models), len(m.Unsupported()), len(m.Warnings()))
+
+	// Routing contract against real records: a Claude client prefers the
+	// Anthropic endpoint under prefer-client-protocol, while native mode keeps
+	// the model's own protocol.
+	cfg := liveConsoleCfg()
+	cfg.Routing = config.Routing{Mode: config.RoutingPreferClient, AllowTranslation: true}
+	decision, eErr := ResolveRoute(cfg, glm, RouteMessages)
+	if eErr != nil {
+		t.Fatalf("prefer-client route: %v", eErr)
+	}
+	if decision.UpstreamProtocol != RouteMessages || decision.UpstreamURL != cfg.Endpoints.Messages {
+		t.Errorf("prefer-client decision = %+v, want messages", decision)
+	}
+	cfg.Routing.Mode = config.RoutingNative
+	native, eErr := ResolveRoute(cfg, glm, RouteMessages)
+	if eErr != nil {
+		t.Fatalf("native route: %v", eErr)
+	}
+	if native.UpstreamProtocol != glm.NativeProtocol {
+		t.Errorf("native decision = %+v, want %s", native, glm.NativeProtocol)
+	}
 }

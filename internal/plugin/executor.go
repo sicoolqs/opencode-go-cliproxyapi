@@ -76,15 +76,57 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 		})
 	}
 	if rec.Protocol == catalog.RouteGoogle {
-		// Catalog resolution already falls back to chat-completions for
-		// Google-native models; only an explicit route-override can pin this
-		// route, and it must fail loudly instead of sending a wrong body.
+		// ResolveRoute falls back to a text protocol for Google-native
+		// models; reaching here means no usable text protocol exists.
 		return nil, classEnvelope(&errclass.Error{
 			Class:   errclass.ClassUnsupported,
-			Message: "google generate-content protocol is not implemented; route this model via chat-completions",
+			Message: "model has no usable text upstream protocol",
 		})
 	}
 	return &resolvedExecution{cfg: cfg, rec: rec, key: key, tools: *shared.NewResponseTools()}, nil
+}
+
+// CPA SourceFormat values the plugin accepts. They mirror the SDK's
+// sdk/translator.Format* constants (asserted by the sdkcheck-tagged test);
+// the SDK translator package is not imported at runtime because it pulls the
+// whole gateway dependency graph into this shared library.
+const (
+	sourceFormatOpenAI         = "openai"
+	sourceFormatClaude         = "claude"
+	sourceFormatOpenAIResponse = "openai-response"
+)
+
+// parseClientProtocol maps CPA's SourceFormat to the plugin's protocol
+// vocabulary. Only formats the plugin declares as input are accepted; an
+// unknown format is an explicit error, never a guess.
+func parseClientProtocol(sourceFormat string) (catalog.Route, *errclass.Error) {
+	switch strings.ToLower(strings.TrimSpace(sourceFormat)) {
+	case sourceFormatOpenAI:
+		return catalog.RouteChatCompletions, nil
+	case sourceFormatClaude:
+		return catalog.RouteMessages, nil
+	case sourceFormatOpenAIResponse:
+		return catalog.RouteResponses, nil
+	}
+	return "", shared.UnsupportedFormat(sourceFormat, "OpenCode Go routing")
+}
+
+// resolveRoute is the single routing entry point shared by the streaming and
+// non-streaming paths: explicit override > routing.mode > capability check >
+// native fallback.
+func (m *Manager) resolveRoute(res *resolvedExecution, sourceFormat string) (catalog.RouteDecision, []byte) {
+	client, eErr := parseClientProtocol(sourceFormat)
+	if eErr != nil {
+		return catalog.RouteDecision{}, classEnvelope(eErr)
+	}
+	decision, eErr := catalog.ResolveRoute(res.cfg, res.rec, client)
+	if eErr != nil {
+		return catalog.RouteDecision{}, classEnvelope(eErr)
+	}
+	debugTrace("executor route model=%s client=%s native=%s upstream=%s conversion=%t reason=%s",
+		res.rec.UpstreamID, decision.ClientProtocol, decision.NativeProtocol,
+		decision.UpstreamProtocol, decision.ConversionNeeded, decision.Reason)
+	return decision, nil
 }
 
 // handleExecute implements executor.execute (non-stream). Stream-flagged
@@ -106,24 +148,28 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
+	decision, routeFail := m.resolveRoute(res, req.SourceFormat)
+	if routeFail != nil {
+		return routeFail, nil
+	}
 	debugTrace("executor session mode=%s source_format=%s x_opencode_session=%s fallback=%t", "non-stream", req.SourceFormat, sessionID, sessionID == emptyOpenCodeSessionID)
-	upstreamBody, eErr := buildUpstreamRequest(res.rec.Protocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking, &res.tools)
+	upstreamBody, eErr := buildUpstreamRequest(decision.UpstreamProtocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking, &res.tools)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
 
-	url := res.rec.EndpointURL
+	url := decision.UpstreamURL
 	if url == "" {
 		url = catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
 	}
-	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s key_count=%d", req.Model, res.rec.UpstreamID, res.rec.Protocol, url, len(res.cfg.APIKeys))
+	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s key_count=%d", req.Model, res.rec.UpstreamID, decision.UpstreamProtocol, url, len(res.cfg.APIKeys))
 	debugTrace("executor sending non-stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
 	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID),
 		Body:    upstreamBody,
 	})
 	if err != nil {
@@ -138,7 +184,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
 		return classEnvelope(errclass.Translation("response exceeds max-response-bytes")), nil
 	}
-	converted, eErr := convertNonStream(res.rec.Protocol, req.SourceFormat, resp.StatusCode, resp.Body, &res.tools)
+	converted, eErr := convertNonStream(decision.UpstreamProtocol, req.SourceFormat, resp.StatusCode, resp.Body, &res.tools)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
@@ -414,13 +460,17 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
+	decision, routeFail := m.resolveRoute(res, req.SourceFormat)
+	if routeFail != nil {
+		return routeFail, nil
+	}
 	debugTrace("executor session mode=%s source_format=%s x_opencode_session=%s fallback=%t", "stream", req.SourceFormat, sessionID, sessionID == emptyOpenCodeSessionID)
-	upstreamBody, eErr := buildUpstreamRequest(res.rec.Protocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking, &res.tools)
+	upstreamBody, eErr := buildUpstreamRequest(decision.UpstreamProtocol, res.rec.UpstreamID, req.SourceFormat, req.OriginalRequest, res.rec.Thinking, &res.tools)
 	if eErr != nil {
 		return classEnvelope(eErr), nil
 	}
 
-	url := res.rec.EndpointURL
+	url := decision.UpstreamURL
 	if url == "" {
 		url = catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
 	}
@@ -430,7 +480,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	st, stHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID),
 		Body:    upstreamBody,
 	})
 	debugTrace("executor stream DoStream status=%d upstreamID=%s err=%v", st, id, err)
@@ -458,12 +508,12 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		if m.bridge != nil {
 			defer m.bridge.inFlight.Done()
 		}
-		m.pumpStream(downID, id, res, req.SourceFormat)
+		m.pumpStream(downID, id, res, req.SourceFormat, decision.UpstreamProtocol)
 	}()
 	return okEnvelope(struct{}{}), nil
 }
 
-func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string) {
+func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string, upstreamProtocol catalog.Route) {
 	var closeOnce sync.Once
 	closeStreams := func(downErrMsg string) {
 		closeOnce.Do(func() {
@@ -485,7 +535,7 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 	})
 	defer watchdog.Stop()
 
-	conv := newStreamConverter(res.rec.Protocol, sourceFormat, &res.tools)
+	conv := newStreamConverter(upstreamProtocol, sourceFormat, &res.tools)
 	var (
 		total          int64
 		upstreamClosed bool

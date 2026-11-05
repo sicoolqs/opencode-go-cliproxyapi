@@ -242,7 +242,12 @@ func pluginConfigFields() []pluginapi.ConfigField {
 		{
 			Name:        "protocols",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Protocol enable/disable switches (`chat-completions: bool`, `messages: bool`, `responses: bool`, `google: bool`).",
+			Description: "Protocol enable/disable switches (`chat-completions: bool`, `messages: bool`, `responses: bool`, `google: bool`). These define the allowed upstream protocol set.",
+		},
+		{
+			Name:        "routing",
+			Type:        pluginapi.ConfigFieldTypeObject,
+			Description: "Protocol routing policy (`mode: native|prefer-client-protocol|anthropic`, `allow-translation: bool`).",
 		},
 		{
 			Name:        "route-overrides",

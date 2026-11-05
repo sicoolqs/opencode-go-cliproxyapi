@@ -84,6 +84,37 @@ func TestLoadRejectsInvalidEndpointURLs(t *testing.T) {
 	}
 }
 
+// Routing defaults to native so upgrades keep the pre-change behavior; an
+// unknown mode or an unsatisfiable anthropic deployment is rejected instead
+// of silently defaulting.
+func TestLoadRoutingDefaultsAndValidation(t *testing.T) {
+	c, err := Load([]byte(withKey))
+	if err != nil {
+		t.Fatalf("Load(minimal): %v", err)
+	}
+	if c.Routing.Mode != RoutingNative {
+		t.Errorf("default mode = %q, want %q", c.Routing.Mode, RoutingNative)
+	}
+	if !c.Routing.AllowTranslation {
+		t.Error("default allow-translation = false, want true")
+	}
+
+	prefer, err := Load([]byte(withKey + "routing:\n  mode: prefer-client-protocol\n  allow-translation: false\n"))
+	if err != nil {
+		t.Fatalf("Load(prefer-client): %v", err)
+	}
+	if prefer.Routing.Mode != RoutingPreferClient || prefer.Routing.AllowTranslation {
+		t.Errorf("routing = %+v", prefer.Routing)
+	}
+
+	if _, err := Load([]byte(withKey + "routing:\n  mode: bogus\n")); err == nil {
+		t.Error("unknown routing mode was accepted")
+	}
+	if _, err := Load([]byte(withKey + "routing:\n  mode: anthropic\nprotocols:\n  messages: false\n")); err == nil {
+		t.Error("anthropic mode with messages disabled was accepted")
+	}
+}
+
 func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
 	c, err := Load([]byte(withKey))
 	if err != nil {

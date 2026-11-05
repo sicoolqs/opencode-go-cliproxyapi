@@ -2,6 +2,10 @@
 
 ### 改进
 
+- 新增按请求的协议路由策略：`routing.mode` 支持 `native`（默认，保持旧行为）、`prefer-client-protocol`（Claude Code → Messages、OpenCode → Chat Completions、Codex → Responses，优先同协议、减少转换）与 `anthropic`（统一 Messages）；`routing.allow-translation` 控制是否允许回退到模型原生协议。
+- 路由决策统一由 `catalog.ResolveRoute` 产出，流式与非流式共用；`protocols.*` 重新定义为允许的上游协议集合，关闭某协议不再隐藏可通过其他协议服务的模型。
+- 协议可用性按“已实现 + 已启用 + 模型可表达”判定：Console 文本模型可跨 API 调用，旧目录与非文本模型仅限原生协议，未知能力不默认支持；不支持时返回明确错误。
+- 显式 `route-overrides` 仍为最高优先级；Google 原生模型无传输时回退到文本协议并输出诊断。
 - 对齐 OpenCode Console Go 官方规范：默认端点改为按协议独立配置（目录 `/inference/go/v1/models`、chat `/inference/go/openai/v1/chat/completions`、responses `/inference/go/openai/v1/responses`、messages `/inference/go/anthropic/v1/messages`、google `/inference/go/google/v1beta`）；显式设置 `base-url` 时保留 `/zen/go/v1` 单基地址布局。
 - 模型目录解析新版字段：`name`、`limit.context/output`、`modalities.input/output`、`capabilities.reasoning.effort`、`api`，并保留原始元数据；旧字段继续兼容。
 - 路由改用目录 `api` 字段作为原生协议依据，前缀表仅作旧目录兜底；Google 原生模型经 chat-completions 转译并输出诊断；未知协议模型进入 `Unsupported()` 诊断而非静默丢弃。

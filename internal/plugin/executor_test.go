@@ -462,6 +462,146 @@ func TestExecuteLegacyBaseURLLayout(t *testing.T) {
 	}
 }
 
+// consoleRouteCatalog declares native protocols via the api map so routing
+// decisions (not name prefixes) drive the upstream choice.
+const consoleRouteCatalog = `{"data":[
+ {"id":"deepseek-v4.1-flash","name":"DeepSeek V4.1 Flash","limit":{"context":1000000,"output":384000},
+  "modalities":{"input":["text"],"output":["text"]},
+  "capabilities":{"reasoning":{"supported":true,"effort":["low","high"]}},
+  "api":{"chat-completions":{"base_url":"https://opencode.ai/inference/go/openai/v1"}}},
+ {"id":"gpt-6-luna","name":"GPT 6 Luna","limit":{"context":1050000,"output":128000},
+  "modalities":{"input":["text"],"output":["text"]},
+  "capabilities":{"reasoning":{"supported":true,"effort":["none","high"]}},
+  "api":{"responses":{"base_url":"https://opencode.ai/inference/go/openai/v1"}}}
+]}`
+
+func newRoutingManager(t *testing.T, routingYAML string, catalog string) (*Manager, *fakeCaller) {
+	t.Helper()
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(catalog, upstreamRouter(t, map[string]string{
+		"/v1/chat/completions": ccResponseBody,
+		"/v1/messages":         claudeResponseBody,
+		"/v1/responses":        responsesPassthrough,
+	}))
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML+routingYAML)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	return m, f
+}
+
+// Claude Code's Messages request must reach the Anthropic endpoint when
+// routing.mode is prefer-client-protocol, even though the model is native
+// chat-completions.
+func TestExecutePreferClientClaudeUsesMessagesUpstream(t *testing.T) {
+	m, f := newRoutingManager(t, "routing:\n  mode: prefer-client-protocol\n", consoleRouteCatalog)
+	env := mustExecute(t, m, "opencode-go/deepseek-v4.1-flash", "claude", []byte(claudeRequestBody))
+	if !env.OK {
+		t.Fatalf("execute: %+v", env.Error)
+	}
+	wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
+	if wire["url"] != "https://opencode.ai/inference/go/anthropic/v1/messages" {
+		t.Fatalf("url = %v, want the Anthropic endpoint", wire["url"])
+	}
+	headers := wire["headers"].(map[string]any)
+	if _, has := headers["X-Api-Key"]; !has {
+		t.Fatalf("messages route must use x-api-key: %v", headers)
+	}
+	body := string(wireBody(t, wire, "body"))
+	if !strings.Contains(body, `"model":"deepseek-v4.1-flash"`) || !strings.Contains(body, `"messages"`) {
+		t.Fatalf("upstream body not Anthropic-shaped: %s", body)
+	}
+	var out pluginapi.ExecutorResponse
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if !strings.Contains(string(out.Payload), "msg_1") {
+		t.Fatalf("payload not passed through as Messages: %s", out.Payload)
+	}
+}
+
+// native mode keeps the pre-change behavior: the same Claude request is
+// translated to the model's chat-completions upstream.
+func TestExecuteNativeClaudeUsesChatUpstream(t *testing.T) {
+	m, f := newRoutingManager(t, "routing:\n  mode: native\n", consoleRouteCatalog)
+	env := mustExecute(t, m, "opencode-go/deepseek-v4.1-flash", "claude", []byte(claudeRequestBody))
+	if !env.OK {
+		t.Fatalf("execute: %+v", env.Error)
+	}
+	wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
+	if wire["url"] != "https://opencode.ai/inference/go/openai/v1/chat/completions" {
+		t.Fatalf("url = %v, want chat completions", wire["url"])
+	}
+	var out pluginapi.ExecutorResponse
+	if err := json.Unmarshal(env.Result, &out); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if !strings.Contains(string(out.Payload), `"content"`) {
+		t.Fatalf("payload not converted back to Messages: %s", out.Payload)
+	}
+}
+
+// The streaming path must use the same decision as the non-streaming path.
+func TestExecuteStreamPreferClientClaudeUsesMessagesUpstream(t *testing.T) {
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(consoleRouteCatalog, streamResponder(streamScript{
+		upstreamID: "up-route",
+		frames:     []string{"data: [DONE]\n\n"},
+	}))
+	if _, err := m.HandleCall("plugin.register",
+		lifecycleRequestBody(testValidYAML+"routing:\n  mode: prefer-client-protocol\n")); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("opencode-go/deepseek-v4.1-flash", "claude", []byte(claudeRequestBody), "down-route"))
+	if err != nil {
+		t.Fatalf("execute_stream: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("envelope: %+v", env.Error)
+	}
+	wire := decodePayload(t, f.callsOf(pluginabi.MethodHostHTTPDoStream)[0])
+	if wire["url"] != "https://opencode.ai/inference/go/anthropic/v1/messages" {
+		t.Fatalf("stream url = %v, want the Anthropic endpoint", wire["url"])
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+}
+
+// Unknown SourceFormat is an explicit error, never a guessed protocol.
+func TestExecuteUnknownSourceFormatRejected(t *testing.T) {
+	m, f := newRoutingManager(t, "routing:\n  mode: prefer-client-protocol\n", consoleRouteCatalog)
+	env := mustExecute(t, m, "opencode-go/deepseek-v4.1-flash", "codex", []byte(`{"input":"hi"}`))
+	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+		t.Fatalf("envelope = %+v, want unsupported", env.Error)
+	}
+	for _, call := range f.callsOf(pluginabi.MethodHostHTTPDo) {
+		var wire map[string]any
+		if err := json.Unmarshal(call.payload, &wire); err != nil {
+			continue
+		}
+		if wire["method"] == http.MethodPost {
+			t.Fatalf("unknown format reached upstream: %v", wire["url"])
+		}
+	}
+}
+
+// An explicit override beats the routing mode.
+func TestExecuteOverrideBeatsRoutingMode(t *testing.T) {
+	routing := "routing:\n  mode: prefer-client-protocol\nroute-overrides:\n  \"deepseek-v4.1-flash\":\n    protocol: \"responses\"\n    endpoint: \"/openai/v1/responses\"\n"
+	m, f := newRoutingManager(t, routing, consoleRouteCatalog)
+	env := mustExecute(t, m, "opencode-go/deepseek-v4.1-flash", "claude", []byte(claudeRequestBody))
+	if !env.OK {
+		t.Fatalf("execute: %+v", env.Error)
+	}
+	wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
+	if wire["url"] != "https://opencode.ai/inference/go/openai/v1/responses" {
+		t.Fatalf("url = %v, want the override endpoint", wire["url"])
+	}
+}
+
 func TestExecuteUnknownModelIs404Envelope(t *testing.T) {
 	m, _ := newExecManager(t)
 	env := mustExecute(t, m, "opencode-go/nope", "openai", []byte(ccRequestBody))

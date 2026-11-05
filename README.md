@@ -96,12 +96,17 @@ plugins:
         refresh-interval: "15m"          # 目录刷新间隔，最小 "1m"（默认："15m"）
         stale-while-unavailable: true    # 刷新失败时保留上一次可用的目录快照（默认：true）
 
-      # 协议开关（默认全开）
+      # 协议开关（默认全开）。定义为允许使用的上游协议集合
       protocols:
-        chat-completions: true   # 启用 chat-completions 路由的模型
-        messages: true           # 启用 messages 路由的模型
-        responses: true          # 启用 responses 路由的模型
-        google: true             # 启用 Google 原生协议的模型（经 chat-completions 转译）
+        chat-completions: true   # 允许 chat-completions 作为上游协议
+        messages: true           # 允许 messages 作为上游协议
+        responses: true          # 允许 responses 作为上游协议
+        google: true             # 允许 Google 原生协议的模型（经文本协议转译）
+
+      # 协议路由策略（默认 native，保持旧行为）
+      routing:
+        mode: "native"           # "native" | "prefer-client-protocol" | "anthropic"
+        allow-translation: true  # 客户端协议不可用时是否允许回退到模型原生协议
 
       # 按模型的显式路由覆盖（优先级高于目录 api 字段与前缀路由）
       route-overrides:
@@ -131,10 +136,12 @@ plugins:
 | `model-prefix.value` | `string` | `opencode-go` | 开启前缀时的服务商前缀字符串。 |
 | `catalog.refresh-interval` | `duration` | `15m` | 目录轮询刷新间隔（如 `15m`、`1h`）。最小为 `1m`。 |
 | `catalog.stale-while-unavailable` | `bool` | `true` | 为 `true` 时，更新失败则继续提供上一次有效的目录快照。 |
-| `protocols.chat-completions` | `bool` | `true` | Chat Completions 端点的协议开关。 |
-| `protocols.messages` | `bool` | `true` | Messages 端点的协议开关。 |
-| `protocols.responses` | `bool` | `true` | Responses 端点的协议开关。 |
-| `protocols.google` | `bool` | `true` | Google 原生协议模型开关（当前经 chat-completions 转译）。 |
+| `protocols.chat-completions` | `bool` | `true` | 允许 Chat Completions 作为上游协议。 |
+| `protocols.messages` | `bool` | `true` | 允许 Messages 作为上游协议。 |
+| `protocols.responses` | `bool` | `true` | 允许 Responses 作为上游协议。 |
+| `protocols.google` | `bool` | `true` | 允许 Google 原生协议的模型（当前经文本协议转译）。 |
+| `routing.mode` | `string` | `native` | 路由策略：`native`（按模型原生协议）、`prefer-client-protocol`（优先客户端协议，不可用时按 `allow-translation` 回退）、`anthropic`（统一走 Messages，要求 `protocols.messages` 开启）。 |
+| `routing.allow-translation` | `bool` | `true` | `prefer-client-protocol` 下客户端协议不可用时，是否允许回退到模型原生协议（需要本地协议转换）。 |
 | `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖目录 `api` 字段与前缀路由。合法协议：`chat-completions`、`messages`、`responses`。`endpoint` 按 `base-url` 拼接（沿用旧规则：前导 `/v1` 会被去掉），默认模式下 `base-url` 为 `https://opencode.ai/inference/go`。 |
 | `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。必须为正数。 |
 | `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
@@ -142,10 +149,11 @@ plugins:
 
 ### 模型路由与元数据
 
-* 路由优先取上游 `/models` 的 `api` 字段（`chat-completions` / `messages` / `responses` / `generate-content`），不再依赖模型名前缀猜测；仅当目录缺少 `api` 时回退到内置前缀表（兼容旧目录）。
+* 路由优先级：显式 `route-overrides` > `routing.mode` > 协议可用性检查 > 原生协议回退。每次请求独立决策，流式与非流式共用同一决策函数。
+* `native`（默认）按目录 `api` 字段的原生协议路由，保持旧版行为；`prefer-client-protocol` 优先使用 CPA 交给插件的客户端协议（Claude Code → Messages、OpenCode → Chat Completions、Codex → Responses），减少本地转换；`anthropic` 对可服务的文本模型统一使用 Messages。
+* 协议可用性同时要求：插件已实现该协议、`protocols.*` 已开启、模型可表达该协议（Console 目录的文本模型可跨 API 调用；旧目录与非文本模型仅限原生协议，未知能力不默认支持）。
 * 目录元数据解析 `name`、`limit.context`、`limit.output`、`modalities.input/output`、`capabilities.reasoning.effort`，并保留模型原始 JSON 供诊断；旧字段（`display_name`、`context_length`、`thinking` 等）继续兼容。
-* Google 原生（`generate-content`）模型当前经 `chat-completions` 转译（Console 对所有文本模型做协议转换），并输出目录告警；若需固定协议可用 `route-overrides`。
-* 无法识别协议的模型不会静默丢弃：会进入 `Unsupported()` 诊断并记录原因。
+* Google 原生（`generate-content`）模型无原生传输，按策略经文本协议转译并输出诊断；无法识别协议的模型进入 `Unsupported()` 诊断，不静默丢弃。
 
 ## 测试
 
