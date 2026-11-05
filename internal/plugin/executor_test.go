@@ -397,7 +397,7 @@ func TestExecuteChatRoute(t *testing.T) {
 	if wire["method"] != http.MethodPost {
 		t.Fatalf("bridged method = %v", wire["method"])
 	}
-	if wire["url"] != "https://opencode.ai/zen/go/v1/chat/completions" {
+	if wire["url"] != "https://opencode.ai/inference/go/openai/v1/chat/completions" {
 		t.Fatalf("bridged url = %v", wire["url"])
 	}
 	headers := wire["headers"].(map[string]any)
@@ -418,6 +418,47 @@ func TestExecuteChatRoute(t *testing.T) {
 	env = mustExecute(t, m, "glm-5.3", "openai", []byte(ccRequestBody))
 	if !env.OK {
 		t.Fatalf("bare-id execute failed: %+v", env.Error)
+	}
+}
+
+// Each protocol must hit its own configured endpoint: the Console gateway
+// serves chat/responses under /openai and messages under /anthropic, so a
+// single base URL cannot express them.
+func TestExecuteUsesPerProtocolEndpoints(t *testing.T) {
+	m, f := newExecManager(t)
+
+	if env := mustExecute(t, m, "opencode-go/minimax-m3", "claude", []byte(claudeRequestBody)); !env.OK {
+		t.Fatalf("messages execute: %+v", env.Error)
+	}
+	if got := lastWire(t, f, pluginabi.MethodHostHTTPDo)["url"]; got != "https://opencode.ai/inference/go/anthropic/v1/messages" {
+		t.Errorf("messages url = %v", got)
+	}
+
+	if env := mustExecute(t, m, "opencode-go/gpt-5.6-luna", "openai-response", []byte(`{"input":"hi"}`)); !env.OK {
+		t.Fatalf("responses execute: %+v", env.Error)
+	}
+	if got := lastWire(t, f, pluginabi.MethodHostHTTPDo)["url"]; got != "https://opencode.ai/inference/go/openai/v1/responses" {
+		t.Errorf("responses url = %v", got)
+	}
+}
+
+// An explicit base-url keeps the legacy single-base layout for operators who
+// have not migrated to the Console endpoints yet.
+func TestExecuteLegacyBaseURLLayout(t *testing.T) {
+	f := &fakeCaller{responder: wrapWithCatalog(multiRouteCatalog, upstreamRouter(t, map[string]string{
+		"/v1/chat/completions": ccResponseBody,
+	}))}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	legacyYAML := testValidYAML + "base-url: https://opencode.ai/zen/go/v1\n"
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(legacyYAML)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody)); !env.OK {
+		t.Fatalf("execute: %+v", env.Error)
+	}
+	if got := lastWire(t, f, pluginabi.MethodHostHTTPDo)["url"]; got != "https://opencode.ai/zen/go/v1/chat/completions" {
+		t.Errorf("legacy url = %v", got)
 	}
 }
 

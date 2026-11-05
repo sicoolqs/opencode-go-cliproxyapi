@@ -75,6 +75,15 @@ func (m *Manager) resolveExecution(req executorRequest) (*resolvedExecution, []b
 			StatusCode: http.StatusNotFound,
 		})
 	}
+	if rec.Protocol == catalog.RouteGoogle {
+		// Catalog resolution already falls back to chat-completions for
+		// Google-native models; only an explicit route-override can pin this
+		// route, and it must fail loudly instead of sending a wrong body.
+		return nil, classEnvelope(&errclass.Error{
+			Class:   errclass.ClassUnsupported,
+			Message: "google generate-content protocol is not implemented; route this model via chat-completions",
+		})
+	}
 	return &resolvedExecution{cfg: cfg, rec: rec, key: key, tools: *shared.NewResponseTools()}, nil
 }
 
@@ -103,7 +112,10 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 		return classEnvelope(eErr), nil
 	}
 
-	url := catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	url := res.rec.EndpointURL
+	if url == "" {
+		url = catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	}
 	debugTrace("executor resolved public_model=%s upstream_model=%s route=%s url=%s key_count=%d", req.Model, res.rec.UpstreamID, res.rec.Protocol, url, len(res.cfg.APIKeys))
 	debugTrace("executor sending non-stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
@@ -159,24 +171,62 @@ func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header
 
 const emptyOpenCodeSessionID = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-// resolveOpenCodeSessionID applies the FR-012/AC-H precedence: CPA's canonical
-// identity, an explicit inbound session header, then the existing content hash.
+// sessionMetadataKeys lists CPA/host metadata keys carrying a stable
+// conversation identity, most authoritative first.
+var sessionMetadataKeys = []string{
+	"canonical_session_id",
+	"session_id",
+	"conversation_id",
+	"prompt_cache_key",
+}
+
+// sessionHeaderNames lists client headers carrying a stable conversation
+// identity, official OpenCode header first, then the native headers of the
+// harnesses Console recognizes (Claude Code, Codex, generic session ids).
+var sessionHeaderNames = []string{
+	"X-Opencode-Session",
+	"X-Session-Affinity",
+	"X-Claude-Code-Session-Id",
+	"X-Conversation-Id",
+	"X-Session-Id",
+	"Session-Id",
+}
+
+// maxSessionIDLen bounds a forwarded session identifier so a hostile client
+// cannot inflate the upstream header without limit.
+const maxSessionIDLen = 200
+
+// resolveOpenCodeSessionID applies the precedence: CPA's canonical identity,
+// an explicit inbound session header, then a digest of the conversation's
+// first user turn. Every branch is deterministic, so a multi-turn
+// conversation keeps one session ID across requests instead of minting a
+// fresh one per call.
 func resolveOpenCodeSessionID(req executorRequest) (string, *errclass.Error) {
-	if sid, ok := req.Metadata["canonical_session_id"].(string); ok && sid != "" {
-		return sid, nil
+	for _, key := range sessionMetadataKeys {
+		if raw, ok := req.Metadata[key]; ok {
+			if sid, ok := raw.(string); ok {
+				if cleaned := sanitizeSessionID(sid); cleaned != "" {
+					return cleaned, nil
+				}
+			}
+		}
 	}
-	for _, name := range []string{
-		"X-Session-Affinity",
-		"X-Opencode-Session",
-		"X-Session-Id",
-		"X-Claude-Code-Session-Id",
-		"Session-Id",
-	} {
-		if sid := req.Headers.Get(name); sid != "" {
+	for _, name := range sessionHeaderNames {
+		if sid := sanitizeSessionID(req.Headers.Get(name)); sid != "" {
 			return sid, nil
 		}
 	}
 	return deriveOpenCodeSessionID(req.SourceFormat, req.OriginalRequest)
+}
+
+// sanitizeSessionID trims a candidate identifier and rejects values that are
+// empty or longer than maxSessionIDLen.
+func sanitizeSessionID(sid string) string {
+	sid = strings.TrimSpace(sid)
+	if sid == "" || len(sid) > maxSessionIDLen {
+		return ""
+	}
+	return sid
 }
 
 // deriveOpenCodeSessionID hashes the model-visible content of the initial user
@@ -370,7 +420,10 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		return classEnvelope(eErr), nil
 	}
 
-	url := catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	url := res.rec.EndpointURL
+	if url == "" {
+		url = catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
+	}
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()

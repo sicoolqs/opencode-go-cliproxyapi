@@ -28,7 +28,8 @@ func (m *Manager) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchReques
 		return empty, fmt.Errorf("quota credential has no API key")
 	}
 	m.mu.RLock()
-	baseURL, timeout := m.cfg.BaseURL, m.cfg.RequestTimeout
+	usageURL, timeout := m.cfg.Endpoints.Usage, m.cfg.RequestTimeout
+	baseURL := m.cfg.BaseURL
 	m.mu.RUnlock()
 	if m.bridge == nil {
 		return empty, fmt.Errorf("quota bridge unavailable")
@@ -36,9 +37,14 @@ func (m *Manager) FetchQuota(ctx context.Context, req pluginapi.QuotaFetchReques
 	if timeout <= 0 || timeout > 20*time.Second {
 		timeout = 20 * time.Second
 	}
+	if usageURL == "" {
+		// Configs constructed without endpoints keep the verified legacy
+		// location; the URL is never inferred from the inference endpoints.
+		usageURL = strings.TrimRight(baseURL, "/") + "/usage"
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: strings.TrimRight(baseURL, "/") + "/usage", Headers: http.Header{"Authorization": {"Bearer " + key}, "Accept": {"application/json"}}})
+	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: usageURL, Headers: http.Header{"Authorization": {"Bearer " + key}, "Accept": {"application/json"}}})
 	if err != nil || resp.StatusCode != http.StatusOK {
 		return empty, fmt.Errorf("quota upstream request failed")
 	}

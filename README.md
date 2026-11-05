@@ -68,11 +68,16 @@ go build -tags debug -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cli
 plugins:
   configs:
     opencode-go-cliproxyapi:
-      # 上游基地址（默认："https://opencode.ai/zen/go/v1"）
-      base-url: "https://opencode.ai/zen/go/v1"
+      # 端点：默认使用 Console Go 网关，按协议分别配置（互不拼接）
+      # catalog-url: "https://opencode.ai/inference/go/v1/models"
+      # chat-completions-url: "https://opencode.ai/inference/go/openai/v1/chat/completions"
+      # responses-url: "https://opencode.ai/inference/go/openai/v1/responses"
+      # messages-url: "https://opencode.ai/inference/go/anthropic/v1/messages"
+      # google-url: "https://opencode.ai/inference/go/google/v1beta"
+      # usage-url: "https://opencode.ai/zen/go/v1/usage"
 
-      # 可选的目录接口覆盖（默认："{base-url}/models"）
-      # catalog-url: "https://opencode.ai/zen/go/v1/models"
+      # 兼容旧部署：显式设置 base-url 时回到单一基地址布局（/zen/go/v1）
+      # base-url: "https://opencode.ai/zen/go/v1"
 
       # 面向客户端的模型 ID 前缀配置
       model-prefix:
@@ -93,11 +98,12 @@ plugins:
 
       # 协议开关（默认全开）
       protocols:
-        chat-completions: true   # 启用路由到 /v1/chat/completions 的模型
-        messages: true           # 启用路由到 /v1/messages 的模型
-        responses: true          # 启用路由到 /v1/responses 的模型
+        chat-completions: true   # 启用 chat-completions 路由的模型
+        messages: true           # 启用 messages 路由的模型
+        responses: true          # 启用 responses 路由的模型
+        google: true             # 启用 Google 原生协议的模型（经 chat-completions 转译）
 
-      # 按模型的显式路由覆盖（优先级高于内置前缀路由）
+      # 按模型的显式路由覆盖（优先级高于目录 api 字段与前缀路由）
       route-overrides:
         "custom-model":
           protocol: "messages"           # "chat-completions" | "messages" | "responses"
@@ -114,8 +120,13 @@ plugins:
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `api-keys` | `[]object` | *（必填）* | API 密钥列表（`- value: "..."`，可选 `name: "Personal"`）。支持 `${ENV_VAR}` 展开。重复与空值会被拒绝。 |
-| `base-url` | `string` | `https://opencode.ai/zen/go/v1` | 上游基地址。必须是合法 HTTPS（`allow-http: true` 时可为 HTTP），且不带查询参数、fragment、userinfo。 |
-| `catalog-url` | `string` | `{base-url}/models` | 目录发现完整 URL。默认为 `{base-url}/models`。 |
+| `catalog-url` | `string` | `https://opencode.ai/inference/go/v1/models` | 模型目录完整 URL。 |
+| `chat-completions-url` | `string` | `https://opencode.ai/inference/go/openai/v1/chat/completions` | Chat Completions 端点。 |
+| `messages-url` | `string` | `https://opencode.ai/inference/go/anthropic/v1/messages` | Anthropic Messages 端点。 |
+| `responses-url` | `string` | `https://opencode.ai/inference/go/openai/v1/responses` | OpenAI Responses 端点。 |
+| `google-url` | `string` | `https://opencode.ai/inference/go/google/v1beta` | Google generateContent 基地址（模型路径按请求追加）。 |
+| `usage-url` | `string` | `https://opencode.ai/zen/go/v1/usage` | 配额用量端点。官方文档未记载 usage 接口，故保留已验证地址，不按 URL 规律迁移。 |
+| `base-url` | `string` | *（不设置）* | **兼容项**。显式设置时改用单一基地址布局：目录 `{base}/models`、chat `{base}/chat/completions`、messages `{base}/messages`、responses `{base}/responses`、usage `{base}/usage`。所有 URL 必须是合法 HTTPS（`allow-http: true` 时可为 HTTP），且不带查询参数、fragment、userinfo。 |
 | `model-prefix.enabled` | `bool` | `true` | 为 `true` 时客户端模型名为 `<prefix>/<model>`；为 `false` 时使用裸模型 ID。 |
 | `model-prefix.value` | `string` | `opencode-go` | 开启前缀时的服务商前缀字符串。 |
 | `catalog.refresh-interval` | `duration` | `15m` | 目录轮询刷新间隔（如 `15m`、`1h`）。最小为 `1m`。 |
@@ -123,10 +134,18 @@ plugins:
 | `protocols.chat-completions` | `bool` | `true` | Chat Completions 端点的协议开关。 |
 | `protocols.messages` | `bool` | `true` | Messages 端点的协议开关。 |
 | `protocols.responses` | `bool` | `true` | Responses 端点的协议开关。 |
-| `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖内置的家族路由。合法协议：`chat-completions`、`messages`、`responses`。 |
+| `protocols.google` | `bool` | `true` | Google 原生协议模型开关（当前经 chat-completions 转译）。 |
+| `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖目录 `api` 字段与前缀路由。合法协议：`chat-completions`、`messages`、`responses`。`endpoint` 按 `base-url` 拼接（沿用旧规则：前导 `/v1` 会被去掉），默认模式下 `base-url` 为 `https://opencode.ai/inference/go`。 |
 | `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。必须为正数。 |
 | `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
-| `allow-http` | `bool` | `false` | 为 `true` 时，`base-url` / `catalog-url` 允许使用 `http://` 方案，便于本地测试。 |
+| `allow-http` | `bool` | `false` | 为 `true` 时，各端点 URL 允许使用 `http://` 方案，便于本地测试。 |
+
+### 模型路由与元数据
+
+* 路由优先取上游 `/models` 的 `api` 字段（`chat-completions` / `messages` / `responses` / `generate-content`），不再依赖模型名前缀猜测；仅当目录缺少 `api` 时回退到内置前缀表（兼容旧目录）。
+* 目录元数据解析 `name`、`limit.context`、`limit.output`、`modalities.input/output`、`capabilities.reasoning.effort`，并保留模型原始 JSON 供诊断；旧字段（`display_name`、`context_length`、`thinking` 等）继续兼容。
+* Google 原生（`generate-content`）模型当前经 `chat-completions` 转译（Console 对所有文本模型做协议转换），并输出目录告警；若需固定协议可用 `route-overrides`。
+* 无法识别协议的模型不会静默丢弃：会进入 `Unsupported()` 诊断并记录原因。
 
 ## 测试
 

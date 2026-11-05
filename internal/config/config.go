@@ -13,15 +13,42 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Defaults (spec 04 §2/§4).
+// Defaults (spec 04 §2/§4). The Go plan is served from the Console
+// inference gateway; the legacy /zen/go/v1 base URL remains available
+// through an explicit base-url setting.
 const (
-	DefaultBaseURL          = "https://opencode.ai/zen/go/v1"
+	DefaultAPIBase            = "https://opencode.ai/inference/go"
+	DefaultCatalogURL         = "https://opencode.ai/inference/go/v1/models"
+	DefaultChatCompletionsURL = "https://opencode.ai/inference/go/openai/v1/chat/completions"
+	DefaultResponsesURL       = "https://opencode.ai/inference/go/openai/v1/responses"
+	DefaultMessagesURL        = "https://opencode.ai/inference/go/anthropic/v1/messages"
+	DefaultGoogleBaseURL      = "https://opencode.ai/inference/go/google/v1beta"
+	// DefaultUsageURL stays on the legacy host: the Console docs do not
+	// document a usage endpoint, and both hosts answer /usage identically
+	// (verified 401 unauthenticated). Per the migration rule the existing
+	// verified endpoint is preserved rather than guessed from URL patterns.
+	DefaultUsageURL         = "https://opencode.ai/zen/go/v1/usage"
 	DefaultModelPrefix      = "opencode-go"
 	DefaultRefreshInterval  = 15 * time.Minute
 	DefaultRequestTimeout   = 5 * time.Minute
 	DefaultMaxResponseBytes = int64(67108864) // 64 MiB
 )
 
+// Endpoints holds the per-protocol upstream URLs. Each protocol has its own
+// full URL because the Console gateway serves them under different prefixes
+// (/openai, /anthropic, /google); a single base URL can no longer express
+// them. Usage is kept separate from the inference endpoints on purpose.
+type Endpoints struct {
+	ChatCompletions string
+	Messages        string
+	Responses       string
+	// Google is the generateContent base; the model path is appended per
+	// request (.../models/<model>:generateContent).
+	Google string
+	Usage  string
+}
+
+// ModelPrefix controls the client-facing model ID prefix.
 type ModelPrefix struct {
 	Enabled bool
 	Value   string
@@ -41,6 +68,10 @@ type Protocols struct {
 	ChatCompletions bool
 	Messages        bool
 	Responses       bool
+	// Google gates models whose native protocol is Gemini generateContent.
+	// Such models are served through chat-completions (Console translates
+	// every text model across APIs); disabling this drops them.
+	Google bool
 }
 
 type RouteOverride struct {
@@ -49,8 +80,14 @@ type RouteOverride struct {
 }
 
 type Config struct {
-	BaseURL          string
+	// BaseURL is the join base used for route-override paths. It is the
+	// legacy base-url when set, otherwise the Console API base.
+	BaseURL string
+	// LegacyBase reports that base-url was explicitly configured, which
+	// selects the pre-Console /zen/go/v1 path layout.
+	LegacyBase       bool
 	CatalogURL       string
+	Endpoints        Endpoints
 	ModelPrefix      ModelPrefix
 	APIKeys          []APIKey
 	Catalog          Catalog
@@ -65,16 +102,21 @@ type Config struct {
 // (apply default) from explicitly-set values including "" (validate as-is).
 // Unknown fields are ignored (host may pass extra keys).
 type rawConfig struct {
-	BaseURL          *string                  `yaml:"base-url"`
-	CatalogURL       *string                  `yaml:"catalog-url"`
-	ModelPrefix      rawPrefix                `yaml:"model-prefix"`
-	APIKeys          []rawKey                 `yaml:"api-keys"`
-	Catalog          rawCatalog               `yaml:"catalog"`
-	Protocols        rawProtocols             `yaml:"protocols"`
-	RouteOverrides   map[string]RouteOverride `yaml:"route-overrides"`
-	AllowHTTP        bool                     `yaml:"allow-http"`
-	RequestTimeout   *string                  `yaml:"request-timeout"`
-	MaxResponseBytes *int64                   `yaml:"max-response-bytes"`
+	BaseURL            *string                  `yaml:"base-url"`
+	CatalogURL         *string                  `yaml:"catalog-url"`
+	ChatCompletionsURL *string                  `yaml:"chat-completions-url"`
+	MessagesURL        *string                  `yaml:"messages-url"`
+	ResponsesURL       *string                  `yaml:"responses-url"`
+	GoogleURL          *string                  `yaml:"google-url"`
+	UsageURL           *string                  `yaml:"usage-url"`
+	ModelPrefix        rawPrefix                `yaml:"model-prefix"`
+	APIKeys            []rawKey                 `yaml:"api-keys"`
+	Catalog            rawCatalog               `yaml:"catalog"`
+	Protocols          rawProtocols             `yaml:"protocols"`
+	RouteOverrides     map[string]RouteOverride `yaml:"route-overrides"`
+	AllowHTTP          bool                     `yaml:"allow-http"`
+	RequestTimeout     *string                  `yaml:"request-timeout"`
+	MaxResponseBytes   *int64                   `yaml:"max-response-bytes"`
 }
 
 type rawPrefix struct {
@@ -96,6 +138,7 @@ type rawProtocols struct {
 	ChatCompletions *bool `yaml:"chat-completions"`
 	Messages        *bool `yaml:"messages"`
 	Responses       *bool `yaml:"responses"`
+	Google          *bool `yaml:"google"`
 }
 
 var (
@@ -130,7 +173,8 @@ func Load(yamlBytes []byte) (Config, error) {
 		return Config{}, fmt.Errorf("request-timeout: must be positive")
 	}
 	c := Config{
-		BaseURL: orDefault(raw.BaseURL, DefaultBaseURL),
+		BaseURL:    strings.TrimRight(orDefault(raw.BaseURL, DefaultAPIBase), "/"),
+		LegacyBase: raw.BaseURL != nil,
 		ModelPrefix: ModelPrefix{
 			Enabled: orDefault(raw.ModelPrefix.Enabled, true),
 			Value:   orDefault(raw.ModelPrefix.Value, DefaultModelPrefix),
@@ -144,23 +188,59 @@ func Load(yamlBytes []byte) (Config, error) {
 			ChatCompletions: orDefault(raw.Protocols.ChatCompletions, true),
 			Messages:        orDefault(raw.Protocols.Messages, true),
 			Responses:       orDefault(raw.Protocols.Responses, true),
+			Google:          orDefault(raw.Protocols.Google, true),
 		},
 		RouteOverrides:   raw.RouteOverrides,
 		AllowHTTP:        raw.AllowHTTP,
 		RequestTimeout:   requestTimeout,
 		MaxResponseBytes: orDefault(raw.MaxResponseBytes, DefaultMaxResponseBytes),
 	}
-	if raw.CatalogURL != nil {
-		// Mirror the derived-default trim so an explicit trailing-slash
-		// catalog-url cannot double up separators downstream.
-		c.CatalogURL = strings.TrimRight(*raw.CatalogURL, "/")
+	// Endpoint layout: an explicit base-url selects the legacy
+	// single-base layout (/zen/go/v1 style) for backward compatibility;
+	// otherwise the Console gateway's per-protocol URLs apply.
+	if c.LegacyBase {
+		c.CatalogURL = joinLegacy(c.BaseURL, "/v1/models")
+		c.Endpoints = Endpoints{
+			ChatCompletions: joinLegacy(c.BaseURL, "/v1/chat/completions"),
+			Messages:        joinLegacy(c.BaseURL, "/v1/messages"),
+			Responses:       joinLegacy(c.BaseURL, "/v1/responses"),
+			Usage:           c.BaseURL + "/usage",
+		}
 	} else {
-		c.CatalogURL = strings.TrimRight(c.BaseURL, "/") + "/models"
+		c.CatalogURL = DefaultCatalogURL
+		c.Endpoints = Endpoints{
+			ChatCompletions: DefaultChatCompletionsURL,
+			Messages:        DefaultMessagesURL,
+			Responses:       DefaultResponsesURL,
+			Google:          DefaultGoogleBaseURL,
+			Usage:           DefaultUsageURL,
+		}
 	}
+	trimOverride(&c.CatalogURL, raw.CatalogURL)
+	trimOverride(&c.Endpoints.ChatCompletions, raw.ChatCompletionsURL)
+	trimOverride(&c.Endpoints.Messages, raw.MessagesURL)
+	trimOverride(&c.Endpoints.Responses, raw.ResponsesURL)
+	trimOverride(&c.Endpoints.Google, raw.GoogleURL)
+	trimOverride(&c.Endpoints.Usage, raw.UsageURL)
 	if err := c.validate(); err != nil {
 		return Config{}, err
 	}
 	return c, nil
+}
+
+// joinLegacy reproduces the pre-Console join: the base already carries the
+// version segment, so a leading /v1 on the endpoint path is dropped instead
+// of doubled.
+func joinLegacy(base, path string) string {
+	return strings.TrimSuffix(base, "/") + strings.TrimPrefix(path, "/v1")
+}
+
+// trimOverride applies an explicit URL override, trimming trailing slashes
+// so downstream joins cannot double separators.
+func trimOverride(dst *string, p *string) {
+	if p != nil {
+		*dst = strings.TrimRight(*p, "/")
+	}
 }
 
 // PublicID returns the client-facing model ID (FR-003).
@@ -176,6 +256,25 @@ func (c Config) validate() error {
 		return err
 	}
 	if err := validateURL("catalog-url", c.CatalogURL, c.AllowHTTP); err != nil {
+		return err
+	}
+	if err := validateURL("chat-completions-url", c.Endpoints.ChatCompletions, c.AllowHTTP); err != nil {
+		return err
+	}
+	if err := validateURL("messages-url", c.Endpoints.Messages, c.AllowHTTP); err != nil {
+		return err
+	}
+	if err := validateURL("responses-url", c.Endpoints.Responses, c.AllowHTTP); err != nil {
+		return err
+	}
+	// google-url is optional: the legacy layout has no Google endpoint, and
+	// Google-native models are served through chat-completions.
+	if c.Endpoints.Google != "" {
+		if err := validateURL("google-url", c.Endpoints.Google, c.AllowHTTP); err != nil {
+			return err
+		}
+	}
+	if err := validateURL("usage-url", c.Endpoints.Usage, c.AllowHTTP); err != nil {
 		return err
 	}
 	if len(c.APIKeys) == 0 {

@@ -20,16 +20,98 @@ func requireErrContains(t *testing.T, err error, want string) {
 // that target a later validation check.
 const withKey = "api-keys:\n  - value: sk-dummy\n"
 
+// The Console gateway serves each protocol under its own prefix; a single
+// base URL can no longer express them. Explicit per-protocol overrides must
+// win independently, and an explicit base-url must keep the legacy layout.
+func TestLoadEndpointsLegacyAndOverrides(t *testing.T) {
+	legacy, err := Load([]byte("base-url: https://opencode.ai/zen/go/v1\n" + withKey))
+	if err != nil {
+		t.Fatalf("legacy load: %v", err)
+	}
+	if !legacy.LegacyBase {
+		t.Error("LegacyBase = false, want true for an explicit base-url")
+	}
+	if legacy.CatalogURL != "https://opencode.ai/zen/go/v1/models" {
+		t.Errorf("legacy CatalogURL = %q", legacy.CatalogURL)
+	}
+	if legacy.Endpoints.ChatCompletions != "https://opencode.ai/zen/go/v1/chat/completions" {
+		t.Errorf("legacy chat = %q", legacy.Endpoints.ChatCompletions)
+	}
+	if legacy.Endpoints.Messages != "https://opencode.ai/zen/go/v1/messages" {
+		t.Errorf("legacy messages = %q", legacy.Endpoints.Messages)
+	}
+	if legacy.Endpoints.Usage != "https://opencode.ai/zen/go/v1/usage" {
+		t.Errorf("legacy usage = %q", legacy.Endpoints.Usage)
+	}
+
+	overridden, err := Load([]byte(withKey + `
+chat-completions-url: https://gw.test/openai/v1/chat/completions/
+messages-url: https://gw.test/anthropic/v1/messages
+responses-url: https://gw.test/openai/v1/responses
+usage-url: https://gw.test/v1/usage
+`))
+	if err != nil {
+		t.Fatalf("override load: %v", err)
+	}
+	if overridden.Endpoints.ChatCompletions != "https://gw.test/openai/v1/chat/completions" {
+		t.Errorf("override chat = %q (trailing slash must be trimmed)", overridden.Endpoints.ChatCompletions)
+	}
+	if overridden.Endpoints.Messages != "https://gw.test/anthropic/v1/messages" {
+		t.Errorf("override messages = %q", overridden.Endpoints.Messages)
+	}
+	if overridden.Endpoints.Responses != "https://gw.test/openai/v1/responses" {
+		t.Errorf("override responses = %q", overridden.Endpoints.Responses)
+	}
+	if overridden.Endpoints.Usage != "https://gw.test/v1/usage" {
+		t.Errorf("override usage = %q", overridden.Endpoints.Usage)
+	}
+	// Untouched endpoints keep the Console defaults.
+	if overridden.Endpoints.Google != "https://opencode.ai/inference/go/google/v1beta" {
+		t.Errorf("google default lost: %q", overridden.Endpoints.Google)
+	}
+}
+
+func TestLoadRejectsInvalidEndpointURLs(t *testing.T) {
+	for _, doc := range []string{
+		"messages-url: http://gw.test/v1/messages\n" + withKey,
+		"responses-url: https://gw.test/v1/responses?key=1\n" + withKey,
+		"google-url: ftp://gw.test/v1beta\n" + withKey,
+		"usage-url: https://gw.test/v1/usage#frag\n" + withKey,
+	} {
+		if _, err := Load([]byte(doc)); err == nil {
+			t.Errorf("Load accepted invalid endpoint config: %q", doc)
+		}
+	}
+}
+
 func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
 	c, err := Load([]byte(withKey))
 	if err != nil {
 		t.Fatalf("Load(minimal) failed: %v", err)
 	}
-	if c.BaseURL != "https://opencode.ai/zen/go/v1" {
+	if c.BaseURL != "https://opencode.ai/inference/go" {
 		t.Errorf("BaseURL = %q", c.BaseURL)
 	}
-	if c.CatalogURL != "https://opencode.ai/zen/go/v1/models" {
+	if c.LegacyBase {
+		t.Errorf("LegacyBase = true, want false for the Console defaults")
+	}
+	if c.CatalogURL != "https://opencode.ai/inference/go/v1/models" {
 		t.Errorf("CatalogURL = %q", c.CatalogURL)
+	}
+	if c.Endpoints.ChatCompletions != "https://opencode.ai/inference/go/openai/v1/chat/completions" {
+		t.Errorf("ChatCompletions = %q", c.Endpoints.ChatCompletions)
+	}
+	if c.Endpoints.Messages != "https://opencode.ai/inference/go/anthropic/v1/messages" {
+		t.Errorf("Messages = %q", c.Endpoints.Messages)
+	}
+	if c.Endpoints.Responses != "https://opencode.ai/inference/go/openai/v1/responses" {
+		t.Errorf("Responses = %q", c.Endpoints.Responses)
+	}
+	if c.Endpoints.Google != "https://opencode.ai/inference/go/google/v1beta" {
+		t.Errorf("Google = %q", c.Endpoints.Google)
+	}
+	if c.Endpoints.Usage != "https://opencode.ai/zen/go/v1/usage" {
+		t.Errorf("Usage = %q", c.Endpoints.Usage)
 	}
 	if !c.ModelPrefix.Enabled || c.ModelPrefix.Value != "opencode-go" {
 		t.Errorf("ModelPrefix = %+v", c.ModelPrefix)
@@ -43,7 +125,7 @@ func TestLoadMinimalAppliesAllDefaults(t *testing.T) {
 	if !c.Catalog.StaleWhileUnavailable {
 		t.Errorf("StaleWhileUnavailable = false")
 	}
-	if !c.Protocols.ChatCompletions || !c.Protocols.Messages || !c.Protocols.Responses {
+	if !c.Protocols.ChatCompletions || !c.Protocols.Messages || !c.Protocols.Responses || !c.Protocols.Google {
 		t.Errorf("Protocols = %+v", c.Protocols)
 	}
 	if c.AllowHTTP {

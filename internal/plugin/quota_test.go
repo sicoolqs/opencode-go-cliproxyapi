@@ -33,6 +33,28 @@ func TestQuotaRegistration(t *testing.T) {
 		}
 	}
 }
+func TestQuotaUsageURLConfigured(t *testing.T) {
+	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
+		var req pluginapi.HTTPRequest
+		json.Unmarshal(payload, &req)
+		if req.URL != "https://usage.test/v1/usage" {
+			t.Fatalf("usage url = %q, want the configured usage-url", req.URL)
+		}
+		return hostOK(pluginapi.HTTPResponse{StatusCode: 200, Body: []byte(`{"usage":{"monthly":{"percent":10}}}`)}), nil
+	}}
+	m := NewManager(NewHostBridge(f.call))
+	m.cfg = config.Config{
+		BaseURL:   "https://unused.test",
+		Endpoints: config.Endpoints{Usage: "https://usage.test/v1/usage"},
+	}
+	body, _ := json.Marshal(pluginapi.QuotaFetchRequest{Provider: ProviderID, Attributes: map[string]string{"api_key": "k"}})
+	var got pluginapi.QuotaFetchResponse
+	decodeResult(t, mustHandle(t, m, pluginabi.MethodQuotaFetch, body), &got)
+	if len(got.Groups) != 1 || len(got.Groups[0].Buckets) != 1 {
+		t.Fatalf("buckets = %+v", got)
+	}
+}
+
 func TestQuotaSelectedCredential(t *testing.T) {
 	f := &fakeCaller{responder: func(method string, payload []byte) ([]byte, error) {
 		var req pluginapi.HTTPRequest

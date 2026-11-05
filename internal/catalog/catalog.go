@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 
@@ -36,6 +37,12 @@ const (
 	RouteChatCompletions Route = "chat-completions"
 	RouteMessages        Route = "messages"
 	RouteResponses       Route = "responses"
+	// RouteGoogle is the Gemini generateContent protocol. Models whose
+	// catalog entry declares it are served through chat-completions (the
+	// Console gateway translates every text model across APIs) because this
+	// plugin has no native Gemini adapter; the fallback is reported as a
+	// catalog diagnostic rather than dropped silently.
+	RouteGoogle Route = "google"
 )
 
 // EndpointPath returns the upstream endpoint path for the route (FR-004).
@@ -44,6 +51,7 @@ var routeEndpoints = map[Route]string{
 	RouteChatCompletions: "/v1/chat/completions",
 	RouteMessages:        "/v1/messages",
 	RouteResponses:       "/v1/responses",
+	RouteGoogle:          "/v1beta/models/{model}:generateContent",
 }
 
 // EndpointPath returns the route's upstream endpoint path, or "" for
@@ -66,11 +74,18 @@ type ModelRecord struct {
 	DisplayName  string
 	Protocol     Route
 	EndpointPath string
+	// EndpointURL is the full per-protocol upstream URL from config. Empty
+	// when the snapshot was built from a config without endpoints (tests and
+	// legacy direct construction); callers then fall back to
+	// JoinUpstreamURL(BaseURL, EndpointPath).
+	EndpointURL  string
 	ContextLimit int64
 	OutputLimit  int64
 	InputModes   []string
 	OutputModes  []string
 	Thinking     *pluginapi.ThinkingSupport
+	// Raw preserves the upstream entry verbatim for diagnostics.
+	Raw json.RawMessage
 }
 
 // UnsupportedModel is a discovered model excluded from the routable set,
@@ -86,32 +101,84 @@ type HostClient interface {
 	Do(ctx context.Context, req pluginapi.HTTPRequest) (pluginapi.HTTPResponse, error)
 }
 
-// rawModel tolerantly decodes one catalog entry; unknown fields —
-// including protocol/endpoint fields the catalog does not provide and
-// reasoning/tool_calling flags the plugin does not act on — are ignored via
-// json tags. Modality metadata accepts both spellings.
+// rawModel tolerantly decodes one catalog entry. It understands both the
+// Console Go schema (name / limit / modalities / capabilities.reasoning /
+// api) and the legacy zen-go schema (display_name / context_length /
+// input_modes / thinking); unknown fields are ignored via json tags while
+// Raw keeps the original bytes for diagnostics.
 type rawModel struct {
-	ID               string       `json:"id"`
-	DisplayName      string       `json:"display_name"`
-	ContextLength    int64        `json:"context_length"`
-	MaxOutputTokens  int64        `json:"max_output_tokens"`
-	InputModes       []string     `json:"input_modes"`
-	OutputModes      []string     `json:"output_modes"`
-	InputModalities  []string     `json:"input_modalities"`
-	OutputModalities []string     `json:"output_modalities"`
-	Thinking         *rawThinking `json:"thinking"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+
+	Limit           *rawLimit `json:"limit"`
+	ContextLength   int64     `json:"context_length"`
+	MaxOutputTokens int64     `json:"max_output_tokens"`
+
+	Modalities       *rawModalities `json:"modalities"`
+	InputModes       []string       `json:"input_modes"`
+	OutputModes      []string       `json:"output_modes"`
+	InputModalities  []string       `json:"input_modalities"`
+	OutputModalities []string       `json:"output_modalities"`
+
+	Capabilities *rawCapabilities `json:"capabilities"`
+	Thinking     *rawThinking     `json:"thinking"`
+
+	// API maps a protocol name (chat-completions, messages, responses,
+	// generate-content) to its native endpoint description. This is the
+	// authoritative routing source for the Console catalog.
+	API map[string]rawAPI `json:"api"`
+
+	// Raw is the verbatim upstream entry (populated by Refresh).
+	Raw json.RawMessage `json:"-"`
 }
 
-// rawThinking tolerantly decodes the optional per-model thinking object;
-// pluginapi.ThinkingSupport itself is untagged, so snake_case upstream keys
-// are decoded here and mapped field-by-field (partial objects decode to a
-// partial struct).
+type rawLimit struct {
+	Context int64 `json:"context"`
+	Output  int64 `json:"output"`
+}
+
+type rawModalities struct {
+	Input  []string `json:"input"`
+	Output []string `json:"output"`
+}
+
+type rawCapabilities struct {
+	Reasoning *rawReasoning `json:"reasoning"`
+}
+
+type rawReasoning struct {
+	Supported bool     `json:"supported"`
+	Effort    []string `json:"effort"`
+}
+
+type rawAPI struct {
+	BaseURL string `json:"base_url"`
+}
+
+// rawThinking tolerantly decodes the optional legacy per-model thinking
+// object; pluginapi.ThinkingSupport itself is untagged, so snake_case
+// upstream keys are decoded here and mapped field-by-field (partial objects
+// decode to a partial struct).
 type rawThinking struct {
 	Min            *int     `json:"min"`
 	Max            *int     `json:"max"`
 	ZeroAllowed    *bool    `json:"zero_allowed"`
 	DynamicAllowed *bool    `json:"dynamic_allowed"`
 	Levels         []string `json:"levels"`
+}
+
+// apiProtocolOrder fixes the preference when an entry advertises several
+// native protocols (Console translates between all of them). Chat
+// Completions comes first because it has the widest client compatibility.
+var apiProtocolOrder = []struct {
+	key   string
+	route Route
+}{
+	{"chat-completions", RouteChatCompletions},
+	{"messages", RouteMessages},
+	{"responses", RouteResponses},
+	{"generate-content", RouteGoogle},
 }
 
 // prefixRoutes covers unknown variants of known families;
@@ -215,15 +282,27 @@ func (m *Manager) Refresh(ctx context.Context, apiKey string) error {
 	if err := json.Unmarshal(resp.Body, &env); err != nil {
 		return m.fail("invalid json")
 	}
-	var entries []rawModel
+	var rawEntries []json.RawMessage
 	var warns []string
 	if env.Data == nil {
 		// Key ABSENCE is upstream shape drift, never an intended clear:
 		// clear like an empty plan (swap(nil)) but leave a diagnostic.
 		// A present-but-empty array stays silent (tested-intended state).
 		warns = append(warns, `upstream catalog response missing "data" field`)
-	} else if err := json.Unmarshal(env.Data, &entries); err != nil {
+	} else if err := json.Unmarshal(env.Data, &rawEntries); err != nil {
 		return m.fail("invalid json")
+	}
+	entries := make([]rawModel, 0, len(rawEntries))
+	for _, raw := range rawEntries {
+		var entry rawModel
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			// One malformed entry must not blank the whole catalog: keep the
+			// snapshot and report it, mirroring the per-entry diagnostics.
+			warns = append(warns, "catalog entry is not a JSON object and was skipped")
+			continue
+		}
+		entry.Raw = append(json.RawMessage(nil), raw...)
+		entries = append(entries, entry)
 	}
 	m.swap(entries, warns...)
 	return nil
@@ -268,8 +347,29 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			warns = append(warns, warn)
 		}
 		if !ok {
-			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: "no route determined"})
+			reason := warn
+			if reason == "" {
+				reason = "no route determined"
+			}
+			unsup = append(unsup, UnsupportedModel{UpstreamID: e.ID, Reason: reason})
 			continue
+		}
+		if route == RouteGoogle {
+			// No native Gemini transport in this plugin. Console translates
+			// every text model across its APIs, so serve the model through
+			// chat-completions and say so instead of dropping it silently.
+			if !m.cfg.Protocols.Google {
+				unsup = append(unsup, UnsupportedModel{
+					UpstreamID: e.ID,
+					Reason:     "protocol google disabled by config",
+				})
+				continue
+			}
+			warns = append(warns, fmt.Sprintf(
+				"model %q declares native generate-content; served via chat-completions because no native Google transport is implemented",
+				e.ID))
+			route = RouteChatCompletions
+			endpoint = ""
 		}
 		if !m.protocolEnabled(route) {
 			// Flags apply at snapshot build; a stale snapshot kept per
@@ -299,9 +399,19 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 		}
 		inputModes := firstNonEmpty(e.InputModes, e.InputModalities)
 		outputModes := firstNonEmpty(e.OutputModes, e.OutputModalities)
-		display := e.DisplayName
-		if display == "" {
-			display = e.ID
+		if e.Modalities != nil {
+			inputModes = firstNonEmpty(e.Modalities.Input, inputModes)
+			outputModes = firstNonEmpty(e.Modalities.Output, outputModes)
+		}
+		display := firstNonEmptyString(e.Name, e.DisplayName, e.ID)
+		contextLimit, outputLimit := e.ContextLength, e.MaxOutputTokens
+		if e.Limit != nil {
+			if e.Limit.Context > 0 {
+				contextLimit = e.Limit.Context
+			}
+			if e.Limit.Output > 0 {
+				outputLimit = e.Limit.Output
+			}
 		}
 		rec := ModelRecord{
 			PublicID:     config.PublicID(m.cfg, e.ID),
@@ -309,11 +419,13 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 			DisplayName:  display,
 			Protocol:     route,
 			EndpointPath: endpoint,
-			ContextLimit: e.ContextLength,
-			OutputLimit:  e.MaxOutputTokens,
+			EndpointURL:  m.endpointURL(route, e.ID),
+			ContextLimit: contextLimit,
+			OutputLimit:  outputLimit,
 			InputModes:   inputModes,
 			OutputModes:  outputModes,
-			Thinking:     normalizeThinking(e.Thinking),
+			Thinking:     normalizeThinking(e.Thinking, e.Capabilities),
+			Raw:          e.Raw,
 		}
 		// With a prefix enabled, one record's PublicID can equal another
 		// record's UpstreamID (upstream "foo" and "opencode-go/foo" both
@@ -354,12 +466,15 @@ func (m *Manager) protocolEnabled(r Route) bool {
 		return m.cfg.Protocols.Messages
 	case RouteResponses:
 		return m.cfg.Protocols.Responses
+	case RouteGoogle:
+		return m.cfg.Protocols.Google
 	}
 	return true
 }
 
-// resolve applies route priority strictly: user override, compatibility
-// table (family prefix), none (arch §5).
+// resolve applies route priority strictly: user override, the catalog's
+// authoritative api field, then the legacy compatibility table (family
+// prefix) for catalogs that predate the api field.
 func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
 	if o, ok := m.cfg.RouteOverrides[e.ID]; ok {
 		// Spec 04 §5: an override MUST be visible in diagnostics. Load
@@ -368,6 +483,16 @@ func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
 		return Route(o.Protocol), o.Endpoint, true, fmt.Sprintf(
 			"model %q routed via user override (%s %s)", e.ID, o.Protocol, o.Endpoint)
 	}
+	if len(e.API) > 0 {
+		for _, p := range apiProtocolOrder {
+			if _, ok := e.API[p.key]; ok {
+				return p.route, "", true, ""
+			}
+		}
+		return "", "", false, fmt.Sprintf(
+			"model %q declares no supported api protocol (got %s)",
+			e.ID, strings.Join(sortedKeys(e.API), ", "))
+	}
 	id := strings.ToLower(e.ID)
 	for _, p := range prefixRoutes {
 		if strings.HasPrefix(id, p.prefix) {
@@ -375,6 +500,46 @@ func (m *Manager) resolve(e rawModel) (Route, string, bool, string) {
 		}
 	}
 	return "", "", false, ""
+}
+
+// endpointURL returns the configured full URL for the route. Empty means the
+// config carried no per-protocol endpoints (legacy direct construction) and
+// callers fall back to JoinUpstreamURL.
+func (m *Manager) endpointURL(r Route, upstreamID string) string {
+	switch r {
+	case RouteChatCompletions:
+		return m.cfg.Endpoints.ChatCompletions
+	case RouteMessages:
+		return m.cfg.Endpoints.Messages
+	case RouteResponses:
+		return m.cfg.Endpoints.Responses
+	case RouteGoogle:
+		if m.cfg.Endpoints.Google == "" {
+			return ""
+		}
+		return strings.TrimRight(m.cfg.Endpoints.Google, "/") + "/models/" + upstreamID + ":generateContent"
+	}
+	return ""
+}
+
+// sortedKeys returns map keys in a stable order for diagnostics.
+func sortedKeys(m map[string]rawAPI) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// firstNonEmptyString returns the first non-empty value.
+func firstNonEmptyString(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // JoinUpstreamURL joins the configured base-url onto an endpoint path and
@@ -411,9 +576,29 @@ func firstNonEmpty(a, b []string) []string {
 	return b
 }
 
-// normalizeThinking converts the decoded raw thinking object into its
-// pluginapi form; absent objects yield nil, partial ones a partial struct.
-func normalizeThinking(rt *rawThinking) *pluginapi.ThinkingSupport {
+// normalizeThinking converts the catalog's thinking metadata into its
+// pluginapi form. The Console schema (capabilities.reasoning) wins when
+// present; the legacy per-model thinking object is the fallback. Absent
+// metadata yields nil, partial ones a partial struct.
+func normalizeThinking(rt *rawThinking, caps *rawCapabilities) *pluginapi.ThinkingSupport {
+	if caps != nil && caps.Reasoning != nil {
+		if !caps.Reasoning.Supported {
+			return nil
+		}
+		t := &pluginapi.ThinkingSupport{}
+		if len(caps.Reasoning.Effort) > 0 {
+			t.Levels = append([]string(nil), caps.Reasoning.Effort...)
+			for _, lvl := range t.Levels {
+				switch strings.ToLower(lvl) {
+				case "none":
+					t.ZeroAllowed = true
+				case "auto":
+					t.DynamicAllowed = true
+				}
+			}
+		}
+		return t
+	}
 	if rt == nil {
 		return nil
 	}

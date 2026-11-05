@@ -2,6 +2,14 @@
 
 ### 改进
 
+- 对齐 OpenCode Console Go 官方规范：默认端点改为按协议独立配置（目录 `/inference/go/v1/models`、chat `/inference/go/openai/v1/chat/completions`、responses `/inference/go/openai/v1/responses`、messages `/inference/go/anthropic/v1/messages`、google `/inference/go/google/v1beta`）；显式设置 `base-url` 时保留 `/zen/go/v1` 单基地址布局。
+- 模型目录解析新版字段：`name`、`limit.context/output`、`modalities.input/output`、`capabilities.reasoning.effort`、`api`，并保留原始元数据；旧字段继续兼容。
+- 路由改用目录 `api` 字段作为原生协议依据，前缀表仅作旧目录兜底；Google 原生模型经 chat-completions 转译并输出诊断；未知协议模型进入 `Unsupported()` 诊断而非静默丢弃。
+- Session ID：优先透传 CPA 元数据（`canonical_session_id`/`session_id`/`conversation_id`/`prompt_cache_key`）与官方 `x-opencode-session` 等客户端头，缺失时才按首轮用户内容派生，多轮保持稳定。
+- 配额：新增 `usage-url` 配置项，默认保留已验证的 `/zen/go/v1/usage`，不按 URL 规律迁移。
+
+### 改进
+
 - 升级 CLIProxyAPI SDK 至 `v8.0.42`，并将上游错误响应的 `Retry-After` 指引（秒数或 HTTP-date）透传为 `retry_after_seconds`，使 CPA 认证冷却与下游重试头遵循上游提示。ABI/Schema 无变化。
 - 升级 CLIProxyAPI SDK 至 `v8.0.48`（ABI=1、Schema=9，单 provider 注册保持兼容，无需改动）。
 - 升级 CLIProxyAPI SDK 至 `v8.0.50`（ABI=1、Schema=10，新增能力位均不适用；例行跟进，无代码改动）。

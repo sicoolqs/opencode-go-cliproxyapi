@@ -197,12 +197,37 @@ func pluginConfigFields() []pluginapi.ConfigField {
 		{
 			Name:        "base-url",
 			Type:        pluginapi.ConfigFieldTypeString,
-			Description: "Upstream base URL (default: https://opencode.ai/zen/go/v1).",
+			Description: "Legacy single upstream base URL (e.g. https://opencode.ai/zen/go/v1). When set, per-protocol URLs are derived from it; when unset the Console Go endpoints are used.",
 		},
 		{
 			Name:        "catalog-url",
 			Type:        pluginapi.ConfigFieldTypeString,
-			Description: "Optional catalog discovery URL (default: {base-url}/models).",
+			Description: "Optional model catalog URL (default: https://opencode.ai/inference/go/v1/models).",
+		},
+		{
+			Name:        "chat-completions-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional Chat Completions endpoint (default: https://opencode.ai/inference/go/openai/v1/chat/completions).",
+		},
+		{
+			Name:        "messages-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional Anthropic Messages endpoint (default: https://opencode.ai/inference/go/anthropic/v1/messages).",
+		},
+		{
+			Name:        "responses-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional OpenAI Responses endpoint (default: https://opencode.ai/inference/go/openai/v1/responses).",
+		},
+		{
+			Name:        "google-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional Google generateContent base (default: https://opencode.ai/inference/go/google/v1beta).",
+		},
+		{
+			Name:        "usage-url",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional quota usage endpoint (default: https://opencode.ai/zen/go/v1/usage).",
 		},
 		{
 			Name:        "model-prefix",
@@ -217,7 +242,7 @@ func pluginConfigFields() []pluginapi.ConfigField {
 		{
 			Name:        "protocols",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Protocol enable/disable switches (`chat-completions: bool`, `messages: bool`, `responses: bool`).",
+			Description: "Protocol enable/disable switches (`chat-completions: bool`, `messages: bool`, `responses: bool`, `google: bool`).",
 		},
 		{
 			Name:        "route-overrides",

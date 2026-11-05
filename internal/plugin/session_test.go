@@ -16,9 +16,10 @@ func TestResolveOpenCodeSessionIDPrecedence(t *testing.T) {
 		want     string
 	}{
 		{name: "canonical wins", metadata: map[string]any{"canonical_session_id": "canonical"}, headers: http.Header{"X-Session-Affinity": []string{"header"}}, want: "canonical"},
-		{name: "headers use documented order", headers: http.Header{"X-Session-Affinity": []string{"affinity"}, "X-Opencode-Session": []string{"opencode"}}, want: "affinity"},
-		{name: "empty earlier header is skipped", headers: http.Header{"X-Session-Affinity": []string{""}, "X-Opencode-Session": []string{"opencode"}}, want: "opencode"},
-		{name: "opaque values are preserved", headers: http.Header{"X-Session-Id": []string{"  opaque\tvalue  "}}, want: "  opaque\tvalue  "},
+		{name: "metadata session id beats headers", metadata: map[string]any{"session_id": "meta"}, headers: http.Header{"X-Opencode-Session": []string{"opencode"}}, want: "meta"},
+		{name: "official opencode header wins", headers: http.Header{"X-Session-Affinity": []string{"affinity"}, "X-Opencode-Session": []string{"opencode"}}, want: "opencode"},
+		{name: "empty earlier header is skipped", headers: http.Header{"X-Opencode-Session": []string{"  "}, "X-Session-Affinity": []string{"affinity"}}, want: "affinity"},
+		{name: "opaque values are trimmed", headers: http.Header{"X-Session-Id": []string{"  opaque\tvalue  "}}, want: "opaque\tvalue"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -35,6 +36,30 @@ func TestResolveOpenCodeSessionIDPrecedence(t *testing.T) {
 	want, wantErr := deriveOpenCodeSessionID(req.SourceFormat, req.OriginalRequest)
 	if eErr != wantErr || got != want {
 		t.Fatalf("fallback session = %q, error = %v, want %q, error %v", got, eErr, want, wantErr)
+	}
+}
+
+func TestResolveOpenCodeSessionIDStableAcrossTurns(t *testing.T) {
+	turn1 := `{"messages":[{"role":"user","content":"first question"}]}`
+	turn2 := `{"messages":[{"role":"user","content":"first question"},{"role":"assistant","content":"answer"},{"role":"user","content":"follow up"}]}`
+	a, eErr := resolveOpenCodeSessionID(executorRequest{ExecutorRequest: pluginapi.ExecutorRequest{SourceFormat: "openai", OriginalRequest: []byte(turn1)}})
+	if eErr != nil {
+		t.Fatalf("turn1: %v", eErr)
+	}
+	b, eErr := resolveOpenCodeSessionID(executorRequest{ExecutorRequest: pluginapi.ExecutorRequest{SourceFormat: "openai", OriginalRequest: []byte(turn2)}})
+	if eErr != nil {
+		t.Fatalf("turn2: %v", eErr)
+	}
+	if a != b {
+		t.Fatalf("session changed between turns: %q vs %q", a, b)
+	}
+	// A different conversation must not inherit the session.
+	c, eErr := resolveOpenCodeSessionID(executorRequest{ExecutorRequest: pluginapi.ExecutorRequest{SourceFormat: "openai", OriginalRequest: []byte(`{"messages":[{"role":"user","content":"other"}]}`)}})
+	if eErr != nil {
+		t.Fatalf("other: %v", eErr)
+	}
+	if c == a {
+		t.Fatalf("distinct conversations share session %q", a)
 	}
 }
 
