@@ -228,10 +228,9 @@ type Manager struct {
 	index map[string]ModelRecord
 	unsup []UnsupportedModel
 	warns []string
-	// diags is the structured form of warns+unsup; diagSeen tracks the
-	// diagnostics already logged so repeated refreshes stay quiet.
-	diags    []Diagnostic
-	diagSeen map[string]struct{}
+	// diags is the structured form of warns+unsup. Dedup state lives on the
+	// plugin Manager, which outlives per-reconfigure catalog managers.
+	diags []Diagnostic
 }
 
 // New returns a Manager serving cfg through the host client.
@@ -335,7 +334,6 @@ func (m *Manager) fail(category string) error {
 		// records are gone (FR-002). Raw entries go with them: a cleared
 		// snapshot has nothing to seed.
 		m.raw, m.models, m.index, m.unsup, m.warns, m.diags = nil, nil, nil, nil, nil, nil
-		m.diagSeen = nil
 	}
 	return fmt.Errorf("catalog refresh failed: %s", category)
 }
@@ -693,24 +691,4 @@ func (m *Manager) Diagnostics() []Diagnostic {
 	out := make([]Diagnostic, len(m.diags))
 	copy(out, m.diags)
 	return out
-}
-
-// FreshDiagnostics returns only diagnostics whose kind/model/message were not
-// present at the previous call, then records the current set. Unchanged
-// diagnostics stay quiet across refreshes; a diagnostic that disappears and
-// later reappears is new again.
-func (m *Manager) FreshDiagnostics() []Diagnostic {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	current := make(map[string]struct{}, len(m.diags))
-	fresh := make([]Diagnostic, 0, len(m.diags))
-	for _, d := range m.diags {
-		key := d.Key()
-		current[key] = struct{}{}
-		if _, ok := m.diagSeen[key]; !ok {
-			fresh = append(fresh, d)
-		}
-	}
-	m.diagSeen = current
-	return fresh
 }

@@ -227,7 +227,7 @@ func manualTick(t *testing.T, m *Manager) {
 	if mgr == nil {
 		t.Fatal("no served manager to tick")
 	}
-	if err := refreshOnce(context.Background(), mgr, m.bridge, time.Second, cfg); err != nil {
+	if err := m.refreshOnce(context.Background(), mgr, time.Second, cfg); err != nil {
 		t.Fatalf("tick refresh: %v", err)
 	}
 }

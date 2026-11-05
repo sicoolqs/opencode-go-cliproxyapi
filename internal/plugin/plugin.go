@@ -57,6 +57,15 @@ type Manager struct {
 	// when no loop is running.
 	stop chan struct{}
 	done chan struct{}
+
+	// diagMu guards diagActive, the set of catalog diagnostics currently
+	// present. It lives on the plugin Manager (not the catalog snapshot) so
+	// register/reconfigure — which build a new catalog manager — do not
+	// replay identical diagnostics. A diagnostic logs when it enters the set
+	// and stays quiet while it remains; a changed or reappearing diagnostic
+	// is new again.
+	diagMu     sync.Mutex
+	diagActive map[string]struct{}
 }
 
 // NewManager returns a dispatcher whose outbound traffic flows through bridge.
@@ -323,7 +332,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 		client = m.bridge
 	}
 	mgr := catalog.New(cfg, client)
-	refreshErr := refreshOnce(context.Background(), mgr, m.bridge, registerRefreshTimeout, cfg)
+	refreshErr := m.refreshOnce(context.Background(), mgr, registerRefreshTimeout, cfg)
 	debugTrace("lifecycle refresh_complete model_count=%d refresh_error=%t", len(mgr.Models()), refreshErr != nil)
 
 	// Retire any running loop and wait for its exit outside m.mu: a mid-refresh
@@ -523,7 +532,7 @@ func (m *Manager) startRefreshLoop(cfg config.Config, mgr *catalog.Manager, inte
 							_ = m.bridge.Log("error", "catalog refresh panicked", nil)
 						}
 					}()
-					refreshOnce(stopCtx, mgr, m.bridge, cfg.RequestTimeout, cfg)
+					m.refreshOnce(stopCtx, mgr, cfg.RequestTimeout, cfg)
 				}()
 			}
 		}
@@ -553,34 +562,52 @@ func (m *Manager) closeStop() chan struct{} {
 // plus the full request-timeout, so close(stop) aborts an in-flight tick
 // (F4). On failure it logs a warn via host.log — error text is a redacted
 // category label from the catalog package, never key material (FR-011).
-func refreshOnce(parent context.Context, mgr *catalog.Manager, bridge *HostBridge, timeout time.Duration, cfg config.Config) error {
+func (m *Manager) refreshOnce(parent context.Context, mgr *catalog.Manager, timeout time.Duration, cfg config.Config) error {
 	// Fallback: configured materialization input is catalog-only; CPA client
 	// authentication remains owned by its AuthProvider and CPA.
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	err := mgr.Refresh(ctx, cfg.APIKeys[0].Value)
 	if err != nil {
-		if bridge != nil {
-			_ = bridge.Log("warn", "catalog refresh failed", map[string]any{"error": err.Error()})
+		if m.bridge != nil {
+			_ = m.bridge.Log("warn", "catalog refresh failed", map[string]any{"error": err.Error()})
 		}
 		return err
 	}
 	// FR-010: surface every catalog diagnostic individually with its own
 	// level, so Docker's default output names the model, cause and impact
-	// instead of a generic summary. Unchanged diagnostics are suppressed by
-	// the catalog's change tracking.
-	logCatalogDiagnostics(mgr, bridge)
+	// instead of a generic summary.
+	m.logCatalogDiagnostics(mgr)
 	return nil
 }
 
-// logCatalogDiagnostics forwards each new catalog diagnostic to host.log at
-// its own level. The message carries the full explanation; fields keep the
-// structured attributes for search.
-func logCatalogDiagnostics(mgr *catalog.Manager, bridge *HostBridge) {
-	if bridge == nil {
+// logCatalogDiagnostics forwards each diagnostic that newly entered the
+// active set to host.log at its own level. Dedup state lives on the plugin
+// Manager and survives register/reconfigure; a diagnostic logs once while it
+// remains present, re-logs when its content changes, and re-logs after it
+// disappears and reappears. The active-set swap happens under diagMu so
+// concurrent refreshes cannot double-log the same diagnostic.
+func (m *Manager) logCatalogDiagnostics(mgr *catalog.Manager) {
+	if m.bridge == nil {
 		return
 	}
-	for _, d := range mgr.FreshDiagnostics() {
+	diags := mgr.Diagnostics()
+	current := make(map[string]struct{}, len(diags))
+	for _, d := range diags {
+		current[d.Key()] = struct{}{}
+	}
+
+	m.diagMu.Lock()
+	fresh := make([]catalog.Diagnostic, 0, len(diags))
+	for _, d := range diags {
+		if _, seen := m.diagActive[d.Key()]; !seen {
+			fresh = append(fresh, d)
+		}
+	}
+	m.diagActive = current
+	m.diagMu.Unlock()
+
+	for _, d := range fresh {
 		fields := make(map[string]any, len(d.Fields)+1)
 		for k, v := range d.Fields {
 			fields[k] = v
@@ -590,7 +617,7 @@ func logCatalogDiagnostics(mgr *catalog.Manager, bridge *HostBridge) {
 		if level == "" {
 			level = "warn"
 		}
-		_ = bridge.Log(level, d.Message, fields)
+		_ = m.bridge.Log(level, d.Message, fields)
 	}
 }
 
