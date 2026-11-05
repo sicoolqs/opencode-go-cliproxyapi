@@ -6,7 +6,7 @@
 
 ## 问题背景
 
-OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions `/v1/chat/completions`、Anthropic Messages `/v1/messages`、OpenAI Responses `/v1/responses`）。
+OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions、Anthropic Messages、OpenAI Responses，以及 Google generateContent）。Console 网关允许文本模型跨 API 调用（由服务端翻译），但每个模型仍有一个目录声明的原生协议。
 
 如果没有本插件，在 CLIProxyAPI 中使用 OpenCode Go 需要为每种协议分别配置 Provider，会带来以下问题：
 - **配置与密钥重复**：同一批 API 密钥必须在多个 Provider 配置块中重复填写。
@@ -24,12 +24,14 @@ OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions `/v
 ## 功能特性
 
 - **单一服务商命名空间**：模型统一带 `opencode-go` 前缀暴露（如 `opencode-go/glm-5.2`、`opencode-go/qwen3.7-max`、`opencode-go/gpt-5.6-luna`）。
+- **官方 Console 端点**：默认按协议使用 OpenCode Console Go 网关的独立端点（目录 / OpenAI / Anthropic / Google 各自完整 URL），并保留 `/zen/go/v1` 单基地址兼容布局。
+- **按请求动态路由**：每次请求根据客户端协议、模型原生协议与可配置策略选择上游协议；同协议优先直通，跨协议复用现有适配器转换。
 - **多协议转换**：在客户端格式与上游端点之间转换请求与流式响应：
   - OpenAI Chat Completions（`/v1/chat/completions`）
   - Anthropic Messages（`/v1/messages`）
   - OpenAI Responses（`/v1/responses`）
-- **思考与推理支持**：在受支持的客户端与上游格式之间映射推理强度（reasoning effort）。
-- **动态目录发现**：拉取远端模型目录，支持本地兜底与自定义路由覆盖。
+- **思考与推理支持**：按目录声明的 `capabilities.reasoning.effort` 发布可用档位，在受支持的客户端与上游格式之间映射推理强度。
+- **动态目录发现**：拉取远端模型目录，解析名称、上下文/输出上限、输入模态与原生协议，支持本地兜底与自定义路由覆盖。
 - **多密钥认证调度**：汇聚多个 API 密钥，复用 CLIProxyAPI 原生调度器，在所有协议间做轮换、重试与错误冷却。
 - **原生配额**：滚动、周、月配额统一走 CLIProxyAPI 通用配额接口，并使用当前选中的凭证。不再保留独立的插件页面。
 
@@ -37,6 +39,8 @@ OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions `/v
 
 - **CLIProxyAPI**：`v8.0.0+`
 - **Go 工具链**：Go 1.26.7+（C-shared 构建模式需要开启 CGO）
+
+> 兼容性验证基线：CLIProxyAPI `v8.0.56`、Claude Code `2.1.318`（Release 构建，Windows amd64）。插件 ABI 为 1，注册 schema 由 CPA SDK 自动上报。
 
 ## 构建
 
@@ -59,6 +63,26 @@ go build -tags debug -buildmode=c-shared -o plugins/darwin/arm64/opencode-go-cli
 ```
 
 将编译产物放入 CLIProxyAPI 的插件目录（例如 `<cliproxyapi_root>/plugins/<os>/<arch>/`）。
+
+## 上游端点
+
+默认使用 OpenCode Console Go 网关（[官方文档](https://opencode.ai/v2/docs/console/go/)），Go 套餐基地址为 `https://opencode.ai/inference/go`。Console 为每种协议提供独立路径，插件按协议分别配置完整 URL，不再由单一 Base URL 拼接：
+
+| 用途 | 默认端点 |
+|---|---|
+| 模型目录 | `https://opencode.ai/inference/go/v1/models` |
+| OpenAI Chat Completions | `https://opencode.ai/inference/go/openai/v1/chat/completions` |
+| OpenAI Responses | `https://opencode.ai/inference/go/openai/v1/responses` |
+| Anthropic Messages | `https://opencode.ai/inference/go/anthropic/v1/messages` |
+| Google generateContent | `https://opencode.ai/inference/go/google/v1beta`（按请求追加 `/models/<model>:generateContent`） |
+| 配额用量 | `https://opencode.ai/zen/go/v1/usage`（保留已验证地址） |
+
+说明：
+
+* 每个端点都可用对应的 `*-url` 配置项覆盖；所有 URL 必须是合法 HTTPS（`allow-http: true` 时可为 HTTP），且不带查询参数、fragment、userinfo。
+* **兼容旧部署**：显式设置 `base-url`（例如 `https://opencode.ai/zen/go/v1`）时回到单基地址布局：目录 `{base}/models`、chat `{base}/chat/completions`、messages `{base}/messages`、responses `{base}/responses`、usage `{base}/usage`。未设置 `base-url` 时使用上表默认值。
+* 官方文档未记载 usage 接口。`/inference/go/v1/usage` 与 `/zen/go/v1/usage` 均存在（未鉴权返回 401），插件保留已验证的后者，并提供 `usage-url` 覆盖，不按 URL 命名规律迁移。
+* Google 原生协议当前没有传输适配器：声明 `generate-content` 的模型会经文本协议转译（Console 会对所有文本模型做协议翻译），并在目录诊断中说明；不会静默丢弃。
 
 ## 配置
 
@@ -147,13 +171,66 @@ plugins:
 | `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
 | `allow-http` | `bool` | `false` | 为 `true` 时，各端点 URL 允许使用 `http://` 方案，便于本地测试。 |
 
-### 模型路由与元数据
+### 模型目录字段
 
-* 路由优先级：显式 `route-overrides` > `routing.mode` > 协议可用性检查 > 原生协议回退。每次请求独立决策，流式与非流式共用同一决策函数。
-* `native`（默认）按目录 `api` 字段的原生协议路由，保持旧版行为；`prefer-client-protocol` 优先使用 CPA 交给插件的客户端协议（Claude Code → Messages、OpenCode → Chat Completions、Codex → Responses），减少本地转换；`anthropic` 对可服务的文本模型统一使用 Messages。
-* 协议可用性同时要求：插件已实现该协议、`protocols.*` 已开启、模型可表达该协议（Console 目录的文本模型可跨 API 调用；旧目录与非文本模型仅限原生协议，未知能力不默认支持）。
-* 目录元数据解析 `name`、`limit.context`、`limit.output`、`modalities.input/output`、`capabilities.reasoning.effort`，并保留模型原始 JSON 供诊断；旧字段（`display_name`、`context_length`、`thinking` 等）继续兼容。
-* Google 原生（`generate-content`）模型无原生传输，按策略经文本协议转译并输出诊断；无法识别协议的模型进入 `Unsupported()` 诊断，不静默丢弃。
+插件解析 OpenCode Console `/v1/models` 的实际结构，并兼容旧版字段：
+
+| 用途 | Console 字段 | 旧字段（兼容） |
+|---|---|---|
+| 显示名 | `name` | `display_name` |
+| 上下文上限 | `limit.context` | `context_length` |
+| 输出上限 | `limit.output` | `max_output_tokens` |
+| 输入模态 | `modalities.input` | `input_modes` / `input_modalities` |
+| 输出模态 | `modalities.output` | `output_modes` / `output_modalities` |
+| Thinking 档位 | `capabilities.reasoning.supported` + `capabilities.reasoning.effort` | `thinking.{levels,zero_allowed,dynamic_allowed}` |
+| 原生协议 | `api.{chat-completions,messages,responses,generate-content}` | 无（回退到前缀表） |
+
+模型原始 JSON 会保留在记录中供诊断；协议开关关闭、端点越权、名称冲突等异常都会进入 `Unsupported()` 诊断并附带原因，不会静默丢弃模型。
+
+### 路由决策
+
+优先级从高到低：
+
+1. **显式覆盖** `route-overrides`（仍为最高优先级）。
+2. **`routing.mode` 策略**。
+3. **协议可用性检查**。
+4. **原生协议回退**。
+
+| `routing.mode` | 行为 | 适用场景 |
+|---|---|---|
+| `native`（默认） | 使用模型目录声明的原生协议 | 保持旧版行为，升级无感 |
+| `prefer-client-protocol` | 优先使用 CPA 交给插件的客户端协议；不可用时按 `allow-translation` 回退原生协议 | 推荐。Claude Code 走 Messages、OpenCode 走 Chat Completions、Codex 走 Responses |
+| `anthropic` | 对可服务的文本模型统一使用 Messages；要求 `protocols.messages` 开启 | Claude Code 专用部署 |
+
+“协议可用”需同时满足：插件已实现该协议、对应 `protocols.*` 开关已开启、模型可表达该协议。Console 目录中的文本模型可跨 API 调用；旧目录模型与非文本输出模型仅限原生协议，未知能力不默认支持。
+
+`protocols.*` 是**允许的上游协议集合**，不是模型过滤器：关闭某个协议不会隐藏“原生协议属于该类型、但可通过其他协议访问”的模型。`prefer-client-protocol` 下若目标协议被关闭，会回退到其他可用协议。
+
+示例：
+
+```text
+Claude Code ──Messages──▶ CPA ──Messages──▶ OpenCode Go   （prefer-client-protocol，零本地转换）
+Claude Code ──Messages──▶ CPA ──Chat──────▶ OpenCode Go   （native，按模型原生协议转换）
+Codex       ──Responses─▶ CPA ──Responses─▶ OpenCode Go
+```
+
+### Thinking 档位
+
+* 档位来源为目录的 `capabilities.reasoning.effort`（如 `glm-5.2` 为 `high/max`，`deepseek-v4.1-flash` 为 `low/high/max`），插件将其 1:1 发布给 CPA。
+* 上下游协议一致时（如 Messages → Messages）Thinking 参数**原样透传**，不做本地改写。
+* 跨协议时使用统一阈值表在“token 预算”和“离散档位”之间换算，并钳制到模型声明的范围内。
+* 模型不支持的档位会被明确拒绝（例如返回 `level "medium" not supported, valid levels: high, max`），不会静默转换。
+* CPA 支持在模型名后使用 `(level)` 语法（如 `opencode-go/glm-5.2(high)`），在调用插件前按已发布档位校验/钳制。
+
+### Session ID
+
+上游要求 Go 套餐请求携带稳定的 `x-opencode-session`。插件按以下优先级取值：
+
+1. CPA 提供的会话元数据（`canonical_session_id`、`session_id`、`conversation_id`、`prompt_cache_key`）。
+2. 客户端会话头：`X-Opencode-Session`、`X-Session-Affinity`、`X-Claude-Code-Session-Id`、`X-Conversation-Id`、`X-Session-Id`、`Session-Id`。
+3. 以上都缺失时，使用会话首个用户轮次内容的 SHA-256（多轮请求保持稳定）。
+
+取值会去除首尾空白并限制长度；不会伪造鉴权信息或绕过上游限制。
 
 ## 测试
 
