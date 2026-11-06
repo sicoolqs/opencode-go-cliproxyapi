@@ -13,7 +13,7 @@
 3. **构建命令**（本机构建）：
    ```powershell
    $env:CGO_ENABLED = "1"
-   go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist\model-quota.dll" .
+   go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist\opencode-go-cliproxyapi.dll" .
    ```
    生成后删除 `-buildmode=c-shared` 附带的 `.h` 文件。
 
@@ -25,7 +25,7 @@ MinGW-w64 只能产出 Windows PE 格式（`.dll`），无法产出 Linux ELF / 
 # Linux x64（glibc 基线 2.17，兼容绝大多数发行版）
 $env:CGO_ENABLED = "1"; $env:GOOS = "linux"; $env:GOARCH = "amd64"
 $env:CC = "D:\Work\zig\zig.exe cc -target x86_64-linux-gnu.2.17"
-go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist\model-quota.so" .
+go build -buildvcs=false -trimpath -buildmode=c-shared -ldflags "-s -w" -o "dist\opencode-go-cliproxyapi.so" .
 
 # macOS（如需）
 $env:CC = "D:\Work\zig\zig.exe cc -target x86_64-macos"    # Intel
@@ -37,7 +37,7 @@ $env:CC = "D:\Work\zig\zig.exe cc -target aarch64-macos"   # Apple Silicon
 - **默认用 glibc 目标（`x86_64-linux-gnu.2.17`）**：Debian/Ubuntu/CentOS 等主流镜像都是 glibc，运行时只认带版本号的 `libc.so.6`。
 - **禁止默认用 musl 目标**：musl 产物依赖无版本号的 `libc.so`，该文件在 glibc 系统上只存在于 `libc6-dev` 开发包，运行时 dlopen 直接报错：
   ```
-  dlopen .../model-quota.so: libc.so: cannot open shared object file: No such file or directory
+  dlopen .../opencode-go-cliproxyapi.so: libc.so: cannot open shared object file: No such file or directory
   ```
   这是本项目实际踩过的坑（CPA 官方 Docker 镜像为 glibc）。
 - 只有确认宿主是 Alpine（musl 系统）时才用 `-target x86_64-linux-musl`。拿不准时请用户先在容器内执行 `cat /etc/os-release` 确认。
@@ -47,7 +47,7 @@ $env:CC = "D:\Work\zig\zig.exe cc -target aarch64-macos"   # Apple Silicon
 用字节级检查代替：
 
 ```powershell
-$bytes = [System.IO.File]::ReadAllBytes("dist\model-quota.so")
+$bytes = [System.IO.File]::ReadAllBytes("dist\opencode-go-cliproxyapi.so")
 $text = [System.Text.Encoding]::ASCII.GetString($bytes)
 # ELF 头：$bytes[4]=2 → ELF64；offset 16 (u16)=0x03 → ET_DYN 共享库；offset 18 (u16)=0x3E → x86-64
 # libc 依赖：$text.Contains("libc.so.6`0") → glibc 产物正确
@@ -65,9 +65,41 @@ $env:HTTP_PROXY = "http://127.0.0.1:7890"; $env:HTTPS_PROXY = "http://127.0.0.1:
 git push origin main
 ```
 
+## 凭证生命周期约定
+
+OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证策略固定为「校验 + 隔离 + 平滑轮换」，**不要伪造 OAuth 续期或向上游发刷新请求**。
+
+- **健康探测**：`GET {usage-url}`，不消耗 token。只有 **401 判定失效**；5xx、403、网络错误、超时一律视为「不确定」，不得禁用凭证。
+- **失效隔离**：`auth.parse` / 重配置 / `auth.refresh` 探测到 401 → 对应凭证 `Disabled: true`，日志只输出 `key_fingerprint`（`keyHash` 前几位），**绝不打印 Key 明文**。
+- **最后凭证保护**：全部 Key 都探测失败时不禁用最后一个，否则 CPA 会因空池返回 503。
+- **凭证身份 = Key 哈希**（`authIDFor` = `opencode-go-key-<sha256>`）。Host 对 `Disabled` 是单向保留的（`preserveAuthDisabledState`），因此「换 Key」必须表现为「新凭证 ID」，不能靠复用旧 ID 复位禁用状态。
+- **旧凭证回收**：`materializeAuthRecords` 会把配置中已移除 Key 对应的凭证置为 `disabled`（文件保留，供人工删除），避免过期 Key 继续参与调度。
+- **周期体检**：`auth.parse` 必须在 `Attributes` 里写 `refresh_interval_seconds`（当前 900）并返回 `NextRefreshAfter`，Host 才会调度 `auth.refresh`；`auth.refresh` 只做有效性校验与必要的禁用，健康时不要清除 Host 管理的禁用位。
+- **去重/状态归属**：需要跨 `register` / `reconfigure` 存活的状态（诊断去重、凭证集合）放在插件 `Manager`，不要放进每次重建的 `catalog.Manager`。
+- **密钥轮换**：`api-keys-file` 与内联 `api-keys` 合并、按值去重（内联名称优先）；文件按 `api-keys-file-poll`（默认 1m，最小 10s）重读，内容变化才应用，并重启目录刷新循环使新 Key 生效。轮换流程是「先加新 Key → 等生效 → 再删旧 Key」。
+
+## 错误分类与超时语义
+
+- 上游 **401 → 401 且不可重试**（交由 CPA 切换凭证）；不要重试同一个失效 Key。
+- **首字节前**的网络错误 → 502，超时 → 504；已开始流式输出后的失败按流内错误处理，不再改写状态码。
+- 配置项 `request-timeout` 对**流式请求不是总时长**：它是首字节上限（`min(request-timeout, 60s)`）+ 空闲超时（按 chunk 重置）。长会话不应被总时长截断，改动此逻辑前先看 `stream_timeout_test.go`。
+- `executor.count_tokens` 只对 **claude 源**代理到上游 `{messages-url}/count_tokens`；其他源格式保持明确的 `unsupported`，不要静默返回 400。
+
+## 日志与诊断约定
+
+- **原因必须写进 message**：CPA 默认日志格式不展示 `host.log` 的 fields，只把 fields 当结构化补充；若原因只在 fields 里，线上等同于丢失。
+- 注册/重配置的诊断要**逐条分级**（info/warn/error）并做**变更抑制**：状态未变不重复输出。去重状态放 `Manager`，否则每次重配置会重复刷屏。
+- 任何涉及凭证的日志只允许出现指纹，不要出现 Key、Authorization、x-api-key 原文。
+
+## 测试注意事项
+
+- `fakeCaller` 会自动持久化 `AuthSave` 并在 `AuthList` 返回（没有 Provider/Path）。凭证探测会给每个 Key 额外产生一次 `host.http.do`，断言调用次数时必须**按 URL 过滤**，否则计数会漂移。
+- 测试插件内部逻辑时不要导入 `sdk/translator`：它会把 gin/logrus 等依赖拖进共享库；插件内同类常量请用本地定义。
+- 修改流式/超时/凭证逻辑后至少跑：`go test -tags debug ./...` 与 `go test -race ./internal/plugin/`（`CGO_ENABLED=1`）。
+
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（审计基线：`router-for-me/CLIProxyAPI@main` commit `2422c6b`，v8.0.32）。适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。适配新版 CPA 时按本清单重跑合规审计。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 
@@ -83,7 +115,7 @@ CPA 仓库 `AGENTS.md` 声称 `/v0/management` 已废弃——那**仅针对内�
 
 ### 升级新版 CPA 时的审计项
 
-1. `sdk/pluginabi/types.go`：核对 `ABIVersion`（当前 1）与 `SchemaVersion`（当前 6）是否变化；若变化需同步 `main.go` 的 `cliproxy_plugin_init` 与 `registrationPayload`
+1. `sdk/pluginabi/types.go`：核对 `ABIVersion`（当前 1）与 `SchemaVersion`（当前 10）是否变化；若变化需同步 `main.go` 的 `cliproxy_plugin_init` 与 `registrationPayload`
 2. `internal/pluginhost/loader_*.go`：核对 C ABI 结构体与 `cliproxy_plugin_init` 符号名是否变化
 3. `internal/pluginhost/rpc_schema.go`：核对方法名（`plugin.register` / `management.register` / `management.handle` / `host.http.*`）与 JSON 字段名（rpc 外壳小写 tag、pluginapi 结构体大写无 tag）是否变化
 4. `internal/api/server_management.go`：确认插件路由的挂载与鉴权方式是否迁移
