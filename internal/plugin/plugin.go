@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -368,11 +369,89 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	return registrationEnvelope(), nil
 }
 
-// materializeAuthRecords makes CPA-visible auth files idempotently. Existing
-// records are discovered through CPA so their host-managed metadata is never
-// overwritten. The full key digest is non-secret and independent of config
-// ordering. The host ABI has no delete/disable callback, so removed keys remain
-// stale records and are not claimed as removed.
+// Credential lifecycle: configured keys are probed at register/reconfigure,
+// rejected keys are disabled so the host stops scheduling them, and records
+// whose key is no longer configured are disabled (the host ABI has no delete).
+const (
+	credentialProbeTimeout = 10 * time.Second
+	credentialFingerprint  = 8 // hex chars of sha256 shown in logs
+)
+
+type credentialHealth int
+
+const (
+	credentialUnknown credentialHealth = iota
+	credentialHealthy
+	credentialRejected
+)
+
+// keyHash returns the full sha256 hex of a key (auth identity).
+func keyHash(key string) string {
+	digest := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(digest[:])
+}
+
+// keyFingerprint returns a short, non-secret identifier for logs.
+func keyFingerprint(key string) string {
+	fp := keyHash(key)
+	if len(fp) > credentialFingerprint {
+		return fp[:credentialFingerprint]
+	}
+	return fp
+}
+
+func authIDFor(key string) string {
+	return "opencode-go-key-" + keyHash(key)
+}
+
+// probeCredential asks the upstream usage endpoint whether the key is
+// accepted. Only a definitive 401 disables a credential: 5xx and transport
+// errors are transient and must never quarantine a working key.
+func (m *Manager) probeCredential(ctx context.Context, cfg config.Config, key string) credentialHealth {
+	if m.bridge == nil || strings.TrimSpace(key) == "" {
+		return credentialUnknown
+	}
+	url := strings.TrimSpace(cfg.Endpoints.Usage)
+	if url == "" {
+		base := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		if base == "" {
+			return credentialUnknown
+		}
+		url = base + "/usage"
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, credentialProbeTimeout)
+	defer cancel()
+	resp, err := m.bridge.Do(probeCtx, pluginapi.HTTPRequest{
+		Method:  http.MethodGet,
+		URL:     url,
+		Headers: http.Header{"Authorization": {"Bearer " + key}, "Accept": {"application/json"}},
+	})
+	if err != nil {
+		return credentialUnknown
+	}
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return credentialHealthy
+	case http.StatusUnauthorized:
+		return credentialRejected
+	}
+	return credentialUnknown
+}
+
+// authFileRecord is the persisted plugin credential shape.
+type authFileRecord struct {
+	Type     string `json:"type"`
+	ID       string `json:"id"`
+	Label    string `json:"label"`
+	APIKey   string `json:"api_key"`
+	Disabled bool   `json:"disabled,omitempty"`
+}
+
+// materializeAuthRecords makes CPA-visible auth files idempotently. Configured
+// keys are probed; rejected keys are disabled when at least one other key is
+// healthy (a single rejected key stays enabled so clients receive a clear 401
+// instead of an opaque 503). Records whose key is no longer configured are
+// disabled instead of left to poison scheduling.
 func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config) error {
 	if m.bridge == nil {
 		return nil
@@ -381,68 +460,185 @@ func (m *Manager) materializeAuthRecords(ctx context.Context, cfg config.Config)
 	if err != nil {
 		return fmt.Errorf("list existing auth records: %w", err)
 	}
-	existing := make(map[string]struct{}, len(entries)*2)
+
+	type existingAuth struct {
+		name     string
+		path     string
+		disabled bool
+	}
+	existing := make(map[string]existingAuth, len(entries))
+	reserved := make(map[string]struct{}, len(entries)*2)
 	for _, entry := range entries {
+		id := strings.TrimSpace(entry.ID)
+		if name := strings.TrimSpace(entry.Name); name != "" {
+			reserved[name] = struct{}{}
+		}
+		if id != "" {
+			reserved[id] = struct{}{}
+		}
+		if entry.Provider != ProviderID && entry.Type != ProviderID &&
+			!strings.HasPrefix(id, "opencode-go-key-") {
+			continue
+		}
+		rec := existingAuth{name: strings.TrimSpace(entry.Name), path: entry.Path, disabled: entry.Disabled}
 		// Before the auth manager is ready, v8 lists disk files without IDs.
-		// Recover identity from those host-reported paths to avoid duplicates
-		// when a credential has a readable filename.
-		if (entry.Provider == ProviderID || entry.Type == ProviderID) && !strings.HasPrefix(entry.ID, "opencode-go-key-") {
+		// Recover identity from the host-reported path when needed.
+		if id == "" || rec.name == "" {
 			if !filepath.IsAbs(entry.Path) {
 				return fmt.Errorf("existing auth record has no absolute path")
 			}
-			raw, err := os.ReadFile(entry.Path)
-			if err != nil {
+			raw, readErr := os.ReadFile(entry.Path)
+			if readErr != nil {
 				return fmt.Errorf("cannot read existing plugin auth record")
 			}
-			var record struct {
-				APIKey string `json:"api_key"`
-			}
-			if json.Unmarshal(raw, &record) != nil || record.APIKey == "" {
+			var fileRec authFileRecord
+			if json.Unmarshal(raw, &fileRec) != nil || fileRec.APIKey == "" {
 				return fmt.Errorf("existing plugin auth record is invalid")
 			}
-			digest := sha256.Sum256([]byte(record.APIKey))
-			existing["opencode-go-key-"+hex.EncodeToString(digest[:])] = struct{}{}
+			if id == "" {
+				id = authIDFor(fileRec.APIKey)
+			}
+			if rec.name == "" {
+				rec.name = filepath.Base(entry.Path)
+				reserved[rec.name] = struct{}{}
+			}
+			rec.disabled = rec.disabled || fileRec.Disabled
 		}
-		if name := strings.TrimSpace(entry.Name); name != "" {
-			existing[name] = struct{}{}
+		if id == "" {
+			continue
 		}
-		if id := strings.TrimSpace(entry.ID); id != "" {
-			existing[id] = struct{}{}
+		existing[id] = rec
+		reserved[id] = struct{}{}
+	}
+
+	// Probe configured keys concurrently; registration latency stays bounded by
+	// one probe timeout rather than one per key.
+	health := make([]credentialHealth, len(cfg.APIKeys))
+	var wg sync.WaitGroup
+	for i, entry := range cfg.APIKeys {
+		wg.Add(1)
+		go func(i int, key string) {
+			defer wg.Done()
+			health[i] = m.probeCredential(ctx, cfg, key)
+		}(i, entry.Value)
+	}
+	wg.Wait()
+	healthy := 0
+	for _, h := range health {
+		if h == credentialHealthy {
+			healthy++
 		}
 	}
-	for i, key := range cfg.APIKeys {
-		digest := sha256.Sum256([]byte(key.Value))
-		hash := hex.EncodeToString(digest[:])
-		id := "opencode-go-key-" + hash
-		name := id + ".json"
-		if _, ok := existing[id]; ok {
+	// Disabling every credential would turn clear 401s into an opaque 503
+	// "no auth available"; keep them enabled when none validated healthy.
+	allowDisable := healthy > 0
+
+	configured := make(map[string]struct{}, len(cfg.APIKeys))
+	for _, entry := range cfg.APIKeys {
+		configured[authIDFor(entry.Value)] = struct{}{}
+	}
+
+	// Retire credentials whose key is no longer configured.
+	for id, rec := range existing {
+		if _, ok := configured[id]; ok {
 			continue
 		}
-		if _, ok := existing[name]; ok {
+		if rec.disabled {
 			continue
 		}
-		name = availableAuthName(accountLabel(cfg, key.Value, "", i), existing)
-		record, err := json.Marshal(struct {
-			Type   string `json:"type"`
-			ID     string `json:"id"`
-			Label  string `json:"label"`
-			APIKey string `json:"api_key"`
-		}{
-			Type: "opencode-go", ID: id, Label: accountLabel(cfg, key.Value, "", i), APIKey: key.Value,
-		})
-		if err != nil {
-			return fmt.Errorf("build auth record")
+		if !allowDisable {
+			_ = m.bridge.Log("warn", fmt.Sprintf(
+				"opencode-go: credential %q is no longer configured but stays enabled because no configured key is healthy; impact: it may still be scheduled",
+				rec.name), map[string]any{"file": rec.name, "reason": "no-healthy-key"})
+			continue
 		}
-		if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{
-			Name: name, JSON: record,
-		}); err != nil {
-			return err
+		if err := m.setAuthDisabled(ctx, rec.name, rec.path, true); err != nil {
+			_ = m.bridge.Log("warn", "opencode-go: failed to disable removed credential", map[string]any{"file": rec.name})
+			continue
 		}
-		existing[id] = struct{}{}
-		existing[name] = struct{}{}
-		debugTrace("auth materialized id=%s file=%s", id, name)
+		_ = m.bridge.Log("warn", fmt.Sprintf(
+			"opencode-go: credential %q is no longer configured and was disabled; impact: it is skipped by the scheduler, the file may be deleted manually",
+			rec.name), map[string]any{"file": rec.name, "reason": "removed-from-config"})
+	}
+
+	// Ensure configured credentials exist with the right enabled state.
+	for i, entry := range cfg.APIKeys {
+		id := authIDFor(entry.Value)
+		label := accountLabel(cfg, entry.Value, "", i)
+		desiredDisabled := health[i] == credentialRejected && allowDisable
+		rec, exists := existing[id]
+		if exists {
+			switch {
+			case desiredDisabled && !rec.disabled:
+				if err := m.setAuthDisabled(ctx, rec.name, rec.path, true); err != nil {
+					_ = m.bridge.Log("warn", "opencode-go: failed to disable credential", map[string]any{"file": rec.name})
+				}
+			case !desiredDisabled && rec.disabled && health[i] == credentialHealthy:
+				// Only a positive probe re-enables: an inconclusive probe must
+				// not override host-managed state.
+				if err := m.setAuthDisabled(ctx, rec.name, rec.path, false); err != nil {
+					_ = m.bridge.Log("warn", "opencode-go: failed to enable credential", map[string]any{"file": rec.name})
+				}
+			}
+		} else {
+			name := availableAuthName(label, reserved)
+			record, marshalErr := json.Marshal(authFileRecord{
+				Type: ProviderID, ID: id, Label: label, APIKey: entry.Value, Disabled: desiredDisabled,
+			})
+			if marshalErr != nil {
+				return fmt.Errorf("build auth record")
+			}
+			if err := m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: name, JSON: record}); err != nil {
+				return err
+			}
+			reserved[name] = struct{}{}
+			debugTrace("auth materialized id=%s file=%s disabled=%t", id, name, desiredDisabled)
+		}
+		if health[i] == credentialRejected {
+			_ = m.bridge.Log("error", fmt.Sprintf(
+				"opencode-go: credential rejected by upstream (401) for key fingerprint %s; impact: %s; action: rotate the API key and reload the config",
+				keyFingerprint(entry.Value), rejectedImpact(desiredDisabled)),
+				map[string]any{"key_fingerprint": keyFingerprint(entry.Value), "reason": "credential-rejected", "disabled": desiredDisabled})
+		}
 	}
 	return nil
+}
+
+// rejectedImpact describes the consequence of a rejected credential.
+func rejectedImpact(disabled bool) string {
+	if disabled {
+		return "credential disabled and skipped by the scheduler"
+	}
+	return "no healthy key remains, so requests fail with 401 until the key is rotated"
+}
+
+// setAuthDisabled rewrites an existing auth file's disabled flag, preserving
+// every other field. A missing path is treated as a no-op failure.
+func (m *Manager) setAuthDisabled(ctx context.Context, name, path string, disabled bool) error {
+	if strings.TrimSpace(path) == "" || !filepath.IsAbs(path) {
+		return fmt.Errorf("credential file path unavailable")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var record map[string]any
+	if err := json.Unmarshal(raw, &record); err != nil || len(record) == 0 {
+		return fmt.Errorf("invalid credential file")
+	}
+	if disabled {
+		record["disabled"] = true
+	} else {
+		delete(record, "disabled")
+	}
+	updated, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(name) == "" {
+		name = filepath.Base(path)
+	}
+	return m.bridge.AuthSave(ctx, pluginapi.HostAuthSaveRequest{Name: name, JSON: updated})
 }
 
 // handleModels implements model.static / model.for_auth (FR-003): the last

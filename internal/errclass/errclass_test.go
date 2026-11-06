@@ -43,8 +43,8 @@ func TestFromStatus(t *testing.T) {
 		class     Class
 		retryable bool
 	}{
-		{"401 auth failure", 401, "bad key", ClassAuth, true},
-		{"401 quota text stays auth", 401, "quota exhausted for key", ClassAuth, true},
+		{"401 auth failure", 401, "bad key", ClassAuth, false},
+		{"401 quota text stays auth", 401, "quota exhausted for key", ClassAuth, false},
 		{"403 forbidden auth failure", 403, "no access", ClassAuth, true},
 		{"402 billing failure", 402, "payment required", ClassBilling, true},
 		{"404 invalid model", 404, "no such model", ClassInvalidModel, false},
@@ -73,9 +73,13 @@ func TestFromStatus(t *testing.T) {
 
 func TestFromNetwork(t *testing.T) {
 	e := FromNetwork(errors.New("dial tcp: refused"))
-	if e.Class != ClassNetwork || !e.Retryable || e.StatusCode != 0 ||
+	if e.Class != ClassNetwork || !e.Retryable || e.StatusCode != 502 ||
 		e.Message != "dial tcp: refused" {
 		t.Errorf("FromNetwork(err) = %+v", e)
+	}
+	timeout := FromNetwork(errors.New("host call host.http.do_stream timed out"))
+	if timeout.StatusCode != 504 {
+		t.Errorf("FromNetwork(timeout) status = %d, want 504", timeout.StatusCode)
 	}
 	nilErr := FromNetwork(nil)
 	if nilErr.Message != "" || !nilErr.Retryable {
@@ -152,11 +156,11 @@ func TestToEnvelopeError(t *testing.T) {
 		t.Errorf("ToEnvelopeError(explicit) = %+v, want HTTPStatus 422", got)
 	}
 
-	// Other classes with StatusCode 0 remain 0.
+	// Network failures surface as retryable gateway errors, not 500.
 	netErr := FromNetwork(errors.New("connection reset"))
 	got = ToEnvelopeError(netErr)
-	if got.HTTPStatus != 0 {
-		t.Errorf("ToEnvelopeError(network) = %+v, want HTTPStatus 0", got)
+	if got.HTTPStatus != 502 {
+		t.Errorf("ToEnvelopeError(network) = %+v, want HTTPStatus 502", got)
 	}
 }
 

@@ -135,6 +135,15 @@ func upstreamRouter(t *testing.T, bodies map[string]string) func(string, []byte)
 				}), nil
 			}
 		}
+		// Credential probes hit the usage endpoint during register; answer 200
+		// so the probe reports a healthy key instead of failing the test.
+		if strings.HasSuffix(url, "/usage") {
+			return hostOK(pluginapi.HTTPResponse{
+				StatusCode: http.StatusOK,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       []byte(`{"usage":{}}`),
+			}), nil
+		}
 		t.Errorf("no canned upstream for url %v", url)
 		return hostErr("test", "unrouted"), nil
 	}
@@ -715,6 +724,10 @@ func TestExecuteMessagesUpstreamStatusClassified(t *testing.T) {
 		var wire map[string]any
 		_ = json.Unmarshal(payload, &wire)
 		url, _ := wire["url"].(string)
+		if method == pluginabi.MethodHostHTTPDo && strings.HasSuffix(url, "/usage") {
+			// Credential probes during register are healthy here.
+			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: []byte(`{"usage":{}}`)}), nil
+		}
 		if method == pluginabi.MethodHostHTTPDo && strings.HasSuffix(url, "/messages") {
 			return hostOK(pluginapi.HTTPResponse{StatusCode: http.StatusServiceUnavailable, Body: []byte("nope")}), nil
 		}
@@ -1661,6 +1674,9 @@ func TestExecuteMalformedUpstreamStatusUsesSelectedKey(t *testing.T) {
 	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML)); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+	// Ignore the credential probe performed during register; only the
+	// execution call is under test.
+	seen = nil
 	env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody))
 	if env.OK || env.Error == nil || env.Error.Code != "unsupported_protocol_or_parameter" || env.Error.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("envelope = %+v", env.Error)

@@ -3,6 +3,9 @@
 package errclass
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -68,7 +71,9 @@ func FromStatus(status int, message string, headers ...http.Header) *Error {
 	}
 	switch status {
 	case 401:
-		return &Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
+		// A rejected credential is not retryable for this auth: the host must
+		// rotate to another credential instead of retrying the same key.
+		return &Error{Class: ClassAuth, Message: msg, StatusCode: status, Retryable: false, RetryAfterSeconds: retryAfter}
 	case 403:
 		return &Error{Class: quotaClass(ClassAuth), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	case 402:
@@ -114,15 +119,38 @@ func RetryAfterFromHeaders(h http.Header) int {
 	return 0
 }
 
-// FromNetwork classifies a PRE-first-byte network/timeout failure; always
-// retryable (§7). Failures observed after the first upstream byte must use
-// PostFirstByteNetwork instead.
+// FromNetwork classifies a PRE-first-byte network/timeout failure. Timeouts
+// surface as 504 and other transport failures as 502, so clients see a
+// retryable gateway error instead of an opaque 500. Failures observed after
+// the first upstream byte must use PostFirstByteNetwork instead.
 func FromNetwork(err error) *Error {
 	msg := ""
 	if err != nil {
 		msg = Redact(err.Error())
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true}
+	status := http.StatusBadGateway
+	if isTimeoutError(err) {
+		status = http.StatusGatewayTimeout
+	}
+	return &Error{Class: ClassNetwork, Message: msg, Retryable: true, StatusCode: status}
+}
+
+// isTimeoutError reports whether err represents a deadline/timeout.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "timed out") ||
+		strings.Contains(lower, "timeout") ||
+		strings.Contains(lower, "deadline exceeded")
 }
 
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the

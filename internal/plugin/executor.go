@@ -410,6 +410,19 @@ func classEnvelope(e *errclass.Error) []byte {
 	return out
 }
 
+// streamStartTimeout bounds how long the upstream may take to produce
+// response headers (first byte). It is capped by request-timeout so an
+// operator-configured shorter value still wins.
+var streamStartTimeout = 60 * time.Second
+
+// streamIdleTimeout returns the idle deadline applied between upstream chunks.
+func streamIdleTimeout(cfg config.Config) time.Duration {
+	if cfg.RequestTimeout > 0 {
+		return cfg.RequestTimeout
+	}
+	return 5 * time.Minute
+}
+
 // streamConverter is the common shape of the three adapters' stream
 // converters: feed one upstream SSE chunk, get translated client events.
 type streamConverter interface {
@@ -475,7 +488,11 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		url = catalog.JoinUpstreamURL(res.cfg.BaseURL, res.rec.EndpointPath)
 	}
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
-	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
+	startTimeout := res.cfg.RequestTimeout
+	if startTimeout <= 0 || startTimeout > streamStartTimeout {
+		startTimeout = streamStartTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
 	defer cancel()
 	st, stHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
@@ -524,7 +541,8 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 	defer closeStreams("")
 
 	var aborted atomic.Bool
-	watchdog := time.AfterFunc(res.cfg.RequestTimeout, func() {
+	idleTimeout := streamIdleTimeout(res.cfg)
+	watchdog := time.AfterFunc(idleTimeout, func() {
 		defer func() {
 			if r := recover(); r != nil && m.bridge != nil {
 				_ = m.bridge.Log("error", "stream watchdog panicked", nil)
@@ -556,6 +574,11 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		if readErrMsg != "" {
 			closeStreams(errclass.Redact(readErrMsg))
 			return
+		}
+		// Reset the idle watchdog on every upstream chunk: long but active
+		// streams must not be cut by a total-duration cap.
+		if len(payload) > 0 {
+			watchdog.Reset(idleTimeout)
 		}
 		total += int64(len(payload))
 		if total > res.cfg.MaxResponseBytes {

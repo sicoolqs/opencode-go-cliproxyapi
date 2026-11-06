@@ -438,12 +438,16 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	}
 
 	calls := f.callsOf(pluginabi.MethodHostHTTPDo)
-	if len(calls) != 1 {
-		t.Fatalf("host.http.do calls = %d, want 1", len(calls))
-	}
 	var wire map[string]any
-	if err := json.Unmarshal(calls[0].payload, &wire); err != nil {
-		t.Fatalf("bridge payload: %v", err)
+	for _, call := range calls {
+		var candidate map[string]any
+		if json.Unmarshal(call.payload, &candidate) == nil &&
+			candidate["url"] == "https://opencode.ai/inference/go/v1/models" {
+			wire = candidate
+		}
+	}
+	if wire == nil {
+		t.Fatalf("catalog call missing among %d host.http.do calls", len(calls))
 	}
 	if wire["method"] != http.MethodGet {
 		t.Fatalf("bridged method = %v, want GET", wire["method"])
@@ -776,12 +780,16 @@ func TestRegisterRefreshesWithConfiguredBearer(t *testing.T) {
 		t.Fatalf("register rejected: %s", resp)
 	}
 	calls := f.callsOf(pluginabi.MethodHostHTTPDo)
-	if len(calls) != 1 {
-		t.Fatalf("host.http.do calls = %d, want 1", len(calls))
-	}
 	var wire map[string]any
-	if err := json.Unmarshal(calls[0].payload, &wire); err != nil {
-		t.Fatalf("bridge payload: %v", err)
+	for _, call := range calls {
+		var candidate map[string]any
+		if json.Unmarshal(call.payload, &candidate) == nil &&
+			candidate["url"] == "https://opencode.ai/inference/go/v1/models" {
+			wire = candidate
+		}
+	}
+	if wire == nil {
+		t.Fatalf("catalog call missing among %d host.http.do calls", len(calls))
 	}
 	headers := wire["headers"].(map[string]any)
 	if headers["Authorization"].([]any)[0].(string) != "Bearer "+dummyKey {

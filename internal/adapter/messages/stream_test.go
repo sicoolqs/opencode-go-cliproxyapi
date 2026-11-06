@@ -350,8 +350,8 @@ func TestStreamOpenAIOrphanToolDelta(t *testing.T) {
 func TestStreamOpenAIErrorEvent(t *testing.T) {
 	sc := NewStreamConverter("openai")
 	_, _, eErr := feed(t, sc, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"bad key\"}}\n\n")
-	if eErr == nil || eErr.Class != errclass.ClassAuth || !eErr.Retryable || eErr.StatusCode != 401 {
-		t.Fatalf("want retryable auth failure, got %+v", eErr)
+	if eErr == nil || eErr.Class != errclass.ClassAuth || eErr.Retryable || eErr.StatusCode != 401 {
+		t.Fatalf("want non-retryable auth failure, got %+v", eErr)
 	}
 }
 

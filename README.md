@@ -33,6 +33,7 @@ OpenCode Go 的模型分布在多种 API 协议上（OpenAI Chat Completions、A
 - **思考与推理支持**：按目录声明的 `capabilities.reasoning.effort` 发布可用档位，在受支持的客户端与上游格式之间映射推理强度。
 - **动态目录发现**：拉取远端模型目录，解析名称、上下文/输出上限、输入模态与原生协议，支持本地兜底与自定义路由覆盖。
 - **多密钥认证调度**：汇聚多个 API 密钥，复用 CLIProxyAPI 原生调度器，在所有协议间做轮换、重试与错误冷却。
+- **凭证健康检查与自动隔离**：注册/重配置时校验每个 Key；401 失效的凭证自动禁用并记录指纹，已移除的旧凭证自动停用，轮换 Key 无需重启即可平滑切换。
 - **原生配额**：滚动、周、月配额统一走 CLIProxyAPI 通用配额接口，并使用当前选中的凭证。不再保留独立的插件页面。
 
 ## 环境要求
@@ -167,7 +168,7 @@ plugins:
 | `routing.mode` | `string` | `native` | 路由策略：`native`（按模型原生协议）、`prefer-client-protocol`（优先客户端协议，不可用时按 `allow-translation` 回退）、`anthropic`（统一走 Messages，要求 `protocols.messages` 开启）。 |
 | `routing.allow-translation` | `bool` | `true` | `prefer-client-protocol` 下客户端协议不可用时，是否允许回退到模型原生协议（需要本地协议转换）。 |
 | `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖目录 `api` 字段与前缀路由。合法协议：`chat-completions`、`messages`、`responses`。`endpoint` 按 `base-url` 拼接（沿用旧规则：前导 `/v1` 会被去掉），默认模式下 `base-url` 为 `https://opencode.ai/inference/go`。 |
-| `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。必须为正数。 |
+| `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。非流式请求为整体超时；流式请求为首字节超时上限（不超过 60s）与**空闲超时**（每收到数据即重置，长会话不会被总时长截断）。必须为正数。 |
 | `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
 | `allow-http` | `bool` | `false` | 为 `true` 时，各端点 URL 允许使用 `http://` 方案，便于本地测试。 |
 
@@ -231,6 +232,17 @@ Codex       ──Responses─▶ CPA ──Responses─▶ OpenCode Go
 3. 以上都缺失时，使用会话首个用户轮次内容的 SHA-256（多轮请求保持稳定）。
 
 取值会去除首尾空白并限制长度；不会伪造鉴权信息或绕过上游限制。
+
+### 凭证健康与轮换
+
+OpenCode Go 使用静态 API Key，没有刷新令牌接口，因此插件通过“校验 + 隔离 + 平滑轮换”保证可用性：
+
+* **注册/重配置校验**：对每个配置 Key 调用 `GET {usage-url}`（无 token 消耗）。仅 **401** 判定为失效；5xx 与网络错误视为不确定，不会禁用凭证。
+* **失效隔离**：401 的凭证写入 `disabled: true`，CPA 调度器不再选中；日志记录 `key_fingerprint`（sha256 前 8 位）与文件名，不记录明文。
+* **最后凭证保护**：若所有配置 Key 都失效，保留启用状态，让客户端收到明确的 401，而不是 503 `no auth available`。
+* **旧凭证停用**：配置中不再存在的 Key 对应凭证会被自动禁用（文件保留，可手工删除），避免过期 Key 继续参与调度。
+* **平滑轮换**：先在 `api-keys` 中同时保留新旧 Key 并重载配置，确认新 Key 生效后再移除旧 Key；在途流不受影响，新请求只用健康凭证。
+* **运行时行为**：上游 401 返回 401 且标记不可重试（交由 CPA 切换凭证）；首字节前网络错误返回 502、超时返回 504；流式请求使用空闲超时，长会话不会被截断。
 
 ## 测试
 
