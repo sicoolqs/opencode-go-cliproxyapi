@@ -1524,7 +1524,8 @@ func TestExecutorIdentifierAndCountTokens(t *testing.T) {
 		t.Fatalf("count_tokens: %v", err)
 	}
 	env = decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	// count_tokens is implemented now; a nil body is a malformed request.
+	if env.OK || env.Error == nil || env.Error.Code != "invalid_request" {
 		t.Fatalf("count_tokens envelope = %s", resp)
 	}
 	// executor.http_request has no handler either: it must classify as

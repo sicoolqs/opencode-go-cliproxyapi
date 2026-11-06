@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -112,6 +114,53 @@ func TestLoadRoutingDefaultsAndValidation(t *testing.T) {
 	}
 	if _, err := Load([]byte(withKey + "routing:\n  mode: anthropic\nprotocols:\n  messages: false\n")); err == nil {
 		t.Error("anthropic mode with messages disabled was accepted")
+	}
+}
+
+// api-keys-file entries merge with inline keys; duplicates keep the inline
+// name and the file is re-read on the configured cadence.
+func TestLoadAPIKeysFileMergesAndDedupes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.yaml")
+	content := "api-keys:\n  - value: sk-file\n    name: File\n  - value: sk-dup\n    name: FileDup\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc := "api-keys:\n  - value: sk-base\n    name: Base\n  - value: sk-dup\n    name: BaseDup\n" +
+		"api-keys-file: " + path + "\n" +
+		"api-keys-file-poll: 30s\n"
+	c, err := Load([]byte(doc))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(c.APIKeys) != 3 {
+		t.Fatalf("keys = %+v, want 3 merged entries", c.APIKeys)
+	}
+	if c.APIKeys[0].Value != "sk-base" || c.APIKeys[1].Value != "sk-dup" || c.APIKeys[2].Value != "sk-file" {
+		t.Errorf("merge order = %+v", c.APIKeys)
+	}
+	if c.APIKeys[1].Name != "BaseDup" {
+		t.Errorf("inline name must win: %+v", c.APIKeys[1])
+	}
+	if len(c.ConfigAPIKeys) != 2 {
+		t.Errorf("ConfigAPIKeys = %+v, want the two inline keys", c.ConfigAPIKeys)
+	}
+	if c.APIKeysFile != path || c.APIKeysFilePoll != 30*time.Second {
+		t.Errorf("file settings = %q %v", c.APIKeysFile, c.APIKeysFilePoll)
+	}
+}
+
+func TestLoadAPIKeysFileErrors(t *testing.T) {
+	if _, err := Load([]byte("api-keys-file: /nonexistent/keys.yaml\n" + withKey)); err == nil {
+		t.Error("missing api-keys-file was accepted")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.yaml")
+	if err := os.WriteFile(path, []byte("api-keys:\n  - value: sk-file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load([]byte("api-keys-file: " + path + "\napi-keys-file-poll: 5s\n")); err == nil {
+		t.Error("too-short api-keys-file-poll was accepted")
 	}
 }
 

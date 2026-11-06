@@ -129,6 +129,62 @@ func (m *Manager) resolveRoute(res *resolvedExecution, sourceFormat string) (cat
 	return decision, nil
 }
 
+// handleCountTokens implements executor.count_tokens by proxying the
+// Anthropic count_tokens endpoint with the selected credential. Only the
+// claude source format has an upstream equivalent; other formats keep the
+// explicit unsupported error.
+func (m *Manager) handleCountTokens(request []byte) ([]byte, error) {
+	var req executorRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return ErrEnvelope("invalid_request", "malformed executor request body"), nil
+	}
+	res, failEnv := m.resolveExecution(req)
+	if res == nil {
+		return failEnv, nil
+	}
+	if strings.ToLower(strings.TrimSpace(req.SourceFormat)) != "claude" {
+		return classEnvelope(&errclass.Error{
+			Class:   errclass.ClassUnsupported,
+			Message: "executor.count_tokens is implemented for the claude source format only",
+		}), nil
+	}
+	sessionID, eErr := resolveOpenCodeSessionID(req)
+	if eErr != nil {
+		return classEnvelope(eErr), nil
+	}
+	body, eErr := shared.RewriteModelID(res.rec.UpstreamID, req.OriginalRequest, "claude")
+	if eErr != nil {
+		return classEnvelope(eErr), nil
+	}
+	base := strings.TrimRight(strings.TrimSpace(res.cfg.Endpoints.Messages), "/")
+	if base == "" {
+		base = strings.TrimRight(catalog.JoinUpstreamURL(res.cfg.BaseURL, "/v1/messages"), "/")
+	}
+	url := base + "/count_tokens"
+	timeout := res.cfg.RequestTimeout
+	if timeout <= 0 || timeout > 20*time.Second {
+		timeout = 20 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
+		Method:  http.MethodPost,
+		URL:     url,
+		Headers: upstreamAuthHeaders(catalog.RouteMessages, res.key, sessionID),
+		Body:    body,
+	})
+	if err != nil {
+		return classEnvelope(errclass.FromNetwork(err)), nil
+	}
+	if resp.StatusCode >= 400 {
+		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body, resp.Headers)), nil
+	}
+	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
+		return classEnvelope(errclass.Translation("response exceeds max-response-bytes")), nil
+	}
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: resp.Body, Headers: resp.Headers}), nil
+}
+
 // handleExecute implements executor.execute (non-stream). Stream-flagged
 // requests are routed to the stream path instead of rejected.
 func (m *Manager) handleExecute(request []byte) ([]byte, error) {

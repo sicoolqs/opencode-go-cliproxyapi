@@ -116,6 +116,10 @@ plugins:
         - value: "sk-opencode-key-2"
         - value: "${OPENCODE_GO_API_KEY}"
 
+      # 可选：外部密钥文件（与 api-keys 合并，按值去重），定期重读实现无缝轮换
+      # api-keys-file: "/run/secrets/opencode-go-keys.yaml"
+      # api-keys-file-poll: "1m"       # 默认 "1m"，最小 "10s"
+
       # 目录发现设置
       catalog:
         refresh-interval: "15m"          # 目录刷新间隔，最小 "1m"（默认："15m"）
@@ -149,7 +153,9 @@ plugins:
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `api-keys` | `[]object` | *（必填）* | API 密钥列表（`- value: "..."`，可选 `name: "Personal"`）。支持 `${ENV_VAR}` 展开。重复与空值会被拒绝。 |
+| `api-keys` | `[]object` | *（必填，可与文件合并）* | API 密钥列表（`- value: "..."`，可选 `name: "Personal"`）。支持 `${ENV_VAR}` 展开。重复与空值会被拒绝。 |
+| `api-keys-file` | `string` | *（不设置）* | 外部密钥文件路径（YAML，格式同 `api-keys`：`api-keys:` 列表或 `- value:` 裸列表）。与 `api-keys` 合并并按值去重，文件内容变化后自动应用，无需重启。 |
+| `api-keys-file-poll` | `duration` | `1m` | 重读 `api-keys-file` 的间隔，最小 `10s`。 |
 | `catalog-url` | `string` | `https://opencode.ai/inference/go/v1/models` | 模型目录完整 URL。 |
 | `chat-completions-url` | `string` | `https://opencode.ai/inference/go/openai/v1/chat/completions` | Chat Completions 端点。 |
 | `messages-url` | `string` | `https://opencode.ai/inference/go/anthropic/v1/messages` | Anthropic Messages 端点。 |
@@ -241,8 +247,11 @@ OpenCode Go 使用静态 API Key，没有刷新令牌接口，因此插件通过
 * **失效隔离**：401 的凭证写入 `disabled: true`，CPA 调度器不再选中；日志记录 `key_fingerprint`（sha256 前 8 位）与文件名，不记录明文。
 * **最后凭证保护**：若所有配置 Key 都失效，保留启用状态，让客户端收到明确的 401，而不是 503 `no auth available`。
 * **旧凭证停用**：配置中不再存在的 Key 对应凭证会被自动禁用（文件保留，可手工删除），避免过期 Key 继续参与调度。
-* **平滑轮换**：先在 `api-keys` 中同时保留新旧 Key 并重载配置，确认新 Key 生效后再移除旧 Key；在途流不受影响，新请求只用健康凭证。
+* **定期体检**：`auth.parse` 声明 `refresh_interval_seconds`（15m）与 `NextRefreshAfter`，Host 会周期性调用 `auth.refresh`；探测到 401 时自动禁用。
+* **外部密钥文件**：`api-keys-file` 由插件定期重读（默认 1m），新增/移除 Key 会自动应用对应凭证，无需重启 CPA。
+* **平滑轮换**：先在 `api-keys` 或密钥文件中同时保留新旧 Key 并重载/等待轮询，确认新 Key 生效后再移除旧 Key；在途流不受影响，新请求只用健康凭证。
 * **运行时行为**：上游 401 返回 401 且标记不可重试（交由 CPA 切换凭证）；首字节前网络错误返回 502、超时返回 504；流式请求使用空闲超时，长会话不会被截断。
+* **count_tokens**：Claude 源的 `/v1/messages/count_tokens` 会以选中凭证代理到上游 Anthropic count_tokens 端点；其他源格式仍返回明确的 unsupported。
 
 ## 测试
 

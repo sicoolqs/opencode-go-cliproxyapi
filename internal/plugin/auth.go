@@ -5,11 +5,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"opencode-go-cliproxyapi/internal/config"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
+// credentialRefreshInterval is how often the host re-checks a static API key.
+const credentialRefreshInterval = 15 * time.Minute
+
+// authProvider implements the pluginapi.AuthProvider contract.
 type authProvider struct{ cfg config.Config }
 
 var _ pluginapi.AuthProvider = authProvider{}
@@ -44,7 +50,13 @@ func (p authProvider) ParseAuth(_ context.Context, req pluginapi.AuthParseReques
 	debugTrace("auth parse handled provider=%s file=%s id=%s api_key_present=%t api_key_length=%d", req.Provider, req.FileName, raw.ID, strings.TrimSpace(raw.APIKey) != "", len(raw.APIKey))
 	return pluginapi.AuthParseResponse{Handled: true, Auth: pluginapi.AuthData{
 		Provider: ProviderID, ID: raw.ID, FileName: req.FileName, Label: accountLabel(p.cfg, raw.APIKey, raw.Label, 0), StorageJSON: req.RawJSON, Disabled: raw.Disabled,
-		Attributes: map[string]string{"api_key": raw.APIKey},
+		Attributes: map[string]string{
+			"api_key": raw.APIKey,
+			// The host schedules auth.refresh from this attribute; the probe
+			// then re-validates a static key without spending tokens.
+			"refresh_interval_seconds": strconv.Itoa(int(credentialRefreshInterval.Seconds())),
+		},
+		NextRefreshAfter: time.Now().Add(credentialRefreshInterval),
 	}}, nil
 }
 

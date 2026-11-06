@@ -32,6 +32,8 @@ const (
 	DefaultRefreshInterval  = 15 * time.Minute
 	DefaultRequestTimeout   = 5 * time.Minute
 	DefaultMaxResponseBytes = int64(67108864) // 64 MiB
+	// DefaultAPIKeysFilePoll is the cadence for re-reading api-keys-file.
+	DefaultAPIKeysFilePoll = time.Minute
 )
 
 // Endpoints holds the per-protocol upstream URLs. Each protocol has its own
@@ -108,11 +110,16 @@ type Config struct {
 	BaseURL string
 	// LegacyBase reports that base-url was explicitly configured, which
 	// selects the pre-Console /zen/go/v1 path layout.
-	LegacyBase       bool
-	CatalogURL       string
-	Endpoints        Endpoints
-	ModelPrefix      ModelPrefix
-	APIKeys          []APIKey
+	LegacyBase  bool
+	CatalogURL  string
+	Endpoints   Endpoints
+	ModelPrefix ModelPrefix
+	APIKeys     []APIKey
+	// ConfigAPIKeys holds only the YAML api-keys entries. api-keys-file
+	// entries are merged into APIKeys on load and re-merged on poll.
+	ConfigAPIKeys    []APIKey
+	APIKeysFile      string
+	APIKeysFilePoll  time.Duration
 	Catalog          Catalog
 	Protocols        Protocols
 	Routing          Routing
@@ -135,6 +142,8 @@ type rawConfig struct {
 	UsageURL           *string                  `yaml:"usage-url"`
 	ModelPrefix        rawPrefix                `yaml:"model-prefix"`
 	APIKeys            []rawKey                 `yaml:"api-keys"`
+	APIKeysFile        *string                  `yaml:"api-keys-file"`
+	APIKeysFilePoll    *string                  `yaml:"api-keys-file-poll"`
 	Catalog            rawCatalog               `yaml:"catalog"`
 	Protocols          rawProtocols             `yaml:"protocols"`
 	Routing            rawRouting               `yaml:"routing"`
@@ -187,9 +196,37 @@ func Load(yamlBytes []byte) (Config, error) {
 		}
 		return Config{}, fmt.Errorf("decode config: invalid YAML structure")
 	}
-	keys := make([]APIKey, len(raw.APIKeys))
+	configKeys := make([]APIKey, len(raw.APIKeys))
 	for i, k := range raw.APIKeys {
-		keys[i] = APIKey{Value: os.ExpandEnv(k.Value), Name: strings.TrimSpace(k.Name)}
+		configKeys[i] = APIKey{Value: os.ExpandEnv(k.Value), Name: strings.TrimSpace(k.Name)}
+	}
+	// Duplicates inside the YAML list stay an error; cross-source duplicates
+	// are deduplicated by MergeAPIKeys.
+	seenConfig := make(map[string]bool, len(configKeys))
+	for _, k := range configKeys {
+		if seenConfig[k.Value] {
+			return Config{}, fmt.Errorf("api-keys: duplicate key values are not allowed")
+		}
+		seenConfig[k.Value] = true
+	}
+	apiKeysFile := ""
+	if raw.APIKeysFile != nil {
+		apiKeysFile = strings.TrimSpace(*raw.APIKeysFile)
+	}
+	keys := configKeys
+	if apiKeysFile != "" {
+		fileKeys, errKeys := LoadKeysFile(apiKeysFile)
+		if errKeys != nil {
+			return Config{}, errKeys
+		}
+		keys = MergeAPIKeys(configKeys, fileKeys)
+	}
+	apiKeysPoll, errPoll := parseDuration("api-keys-file-poll", raw.APIKeysFilePoll, DefaultAPIKeysFilePoll)
+	if errPoll != nil {
+		return Config{}, errPoll
+	}
+	if apiKeysPoll < 10*time.Second {
+		return Config{}, fmt.Errorf("api-keys-file-poll: must be at least 10s")
 	}
 	refreshInterval, err := parseDuration("catalog.refresh-interval", raw.Catalog.RefreshInterval, DefaultRefreshInterval)
 	if err != nil {
@@ -209,7 +246,10 @@ func Load(yamlBytes []byte) (Config, error) {
 			Enabled: orDefault(raw.ModelPrefix.Enabled, true),
 			Value:   orDefault(raw.ModelPrefix.Value, DefaultModelPrefix),
 		},
-		APIKeys: keys,
+		APIKeys:         keys,
+		ConfigAPIKeys:   configKeys,
+		APIKeysFile:     apiKeysFile,
+		APIKeysFilePoll: apiKeysPoll,
 		Catalog: Catalog{
 			RefreshInterval:       refreshInterval,
 			StaleWhileUnavailable: orDefault(raw.Catalog.StaleWhileUnavailable, true),
@@ -420,4 +460,50 @@ func orDefault[T any](p *T, def T) T {
 		return *p
 	}
 	return def
+}
+
+// LoadKeysFile reads an external key file. It accepts either a document with
+// an api-keys list or a bare list of {value,name} entries, so a Kubernetes
+// Secret can carry the same shape as the inline config.
+func LoadKeysFile(path string) ([]APIKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("api-keys-file: cannot read file")
+	}
+	var doc struct {
+		APIKeys []rawKey `yaml:"api-keys"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("api-keys-file: invalid YAML")
+	}
+	entries := doc.APIKeys
+	if entries == nil {
+		var bare []rawKey
+		if err := yaml.Unmarshal(raw, &bare); err == nil {
+			entries = bare
+		}
+	}
+	keys := make([]APIKey, 0, len(entries))
+	for _, entry := range entries {
+		keys = append(keys, APIKey{Value: os.ExpandEnv(entry.Value), Name: strings.TrimSpace(entry.Name)})
+	}
+	return keys, nil
+}
+
+// MergeAPIKeys merges base and extra keys, keeping the first occurrence of
+// each value so inline config names win over file names.
+func MergeAPIKeys(base, extra []APIKey) []APIKey {
+	seen := make(map[string]bool, len(base)+len(extra))
+	out := make([]APIKey, 0, len(base)+len(extra))
+	for _, list := range [][]APIKey{base, extra} {
+		for _, key := range list {
+			value := strings.TrimSpace(key.Value)
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			out = append(out, APIKey{Value: value, Name: strings.TrimSpace(key.Name)})
+		}
+	}
+	return out
 }

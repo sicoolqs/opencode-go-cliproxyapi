@@ -135,11 +135,7 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		if json.Unmarshal(request, &req) != nil {
 			return ErrEnvelope("invalid_request", "malformed auth refresh request body"), nil
 		}
-		resp, err := (authProvider{}).RefreshAuth(context.Background(), req.AuthRefreshRequest)
-		if err != nil {
-			return ErrEnvelope("auth_failure", err.Error()), nil
-		}
-		return okEnvelope(resp), nil
+		return okEnvelope(m.refreshAuth(context.Background(), req.AuthRefreshRequest)), nil
 	case pluginabi.MethodQuotaIdentifier:
 		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
 	case pluginabi.MethodQuotaDescribe:
@@ -159,10 +155,7 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
 	case pluginabi.MethodExecutorCountTokens:
-		return classEnvelope(&errclass.Error{
-			Class:   errclass.ClassUnsupported,
-			Message: "executor.count_tokens has no OpenCode Go equivalent",
-		}), nil
+		return m.handleCountTokens(request)
 	case pluginabi.MethodExecutorHTTPRequest:
 		return classEnvelope(&errclass.Error{
 			Class:   errclass.ClassUnsupported,
@@ -203,6 +196,16 @@ func pluginConfigFields() []pluginapi.ConfigField {
 			Name:        "api-keys",
 			Type:        pluginapi.ConfigFieldTypeArray,
 			Description: "List of OpenCode Go API keys (`- value: ...`, optional `name: Personal`). Supports ${ENV_VAR} expansion.",
+		},
+		{
+			Name:        "api-keys-file",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Optional YAML file with additional API keys (same shape as api-keys); re-read periodically so rotation needs no restart.",
+		},
+		{
+			Name:        "api-keys-file-poll",
+			Type:        pluginapi.ConfigFieldTypeString,
+			Description: "Poll interval for api-keys-file (default: 1m, minimum: 10s).",
 		},
 		{
 			Name:        "base-url",
@@ -366,7 +369,113 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	m.mu.Unlock()
 
 	m.startRefreshLoop(cfg, mgr, interval, stop, done)
+	m.startKeyFilePoll(stop)
 	return registrationEnvelope(), nil
+}
+
+// startKeyFilePoll re-reads api-keys-file and applies changes without a
+// restart. It exits when stop closes (reconfigure or shutdown).
+func (m *Manager) startKeyFilePoll(stop <-chan struct{}) {
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	if cfg.APIKeysFile == "" || m.bridge == nil {
+		return
+	}
+	interval := cfg.APIKeysFilePoll
+	if interval <= 0 {
+		interval = config.DefaultAPIKeysFilePoll
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				m.pollKeyFileOnce()
+			}
+		}
+	}()
+}
+
+// pollKeyFileOnce re-reads the key file and applies a changed key set. It
+// reports whether an update was applied.
+func (m *Manager) pollKeyFileOnce() bool {
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	if cfg.APIKeysFile == "" || m.bridge == nil {
+		return false
+	}
+	fileKeys, err := config.LoadKeysFile(cfg.APIKeysFile)
+	if err != nil {
+		_ = m.bridge.Log("warn", "opencode-go: api-keys-file reload failed",
+			map[string]any{"reason": "unreadable-or-invalid-file"})
+		return false
+	}
+	merged := config.MergeAPIKeys(cfg.ConfigAPIKeys, fileKeys)
+	if sameAPIKeys(merged, cfg.APIKeys) {
+		return false
+	}
+	m.applyAPIKeys(merged)
+	return true
+}
+
+// applyAPIKeys installs a new merged key set: credentials are reconciled and
+// the catalog refresh loop is restarted so it uses the new keys.
+func (m *Manager) applyAPIKeys(keys []config.APIKey) {
+	m.lifeMu.Lock()
+	defer m.lifeMu.Unlock()
+
+	m.mu.Lock()
+	if m.mgr == nil {
+		m.mu.Unlock()
+		return
+	}
+	cfg := m.cfg
+	cfg.APIKeys = keys
+	m.cfg = cfg
+	mgr := m.mgr
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), registerRefreshTimeout)
+	defer cancel()
+	if err := m.materializeAuthRecords(ctx, cfg); err != nil {
+		if m.bridge != nil {
+			_ = m.bridge.Log("warn", "opencode-go: api-keys-file credential update failed",
+				map[string]any{"reason": "materialize-failed"})
+		}
+		return
+	}
+
+	if oldDone := m.closeStop(); oldDone != nil {
+		<-oldDone
+	}
+	stop, done := make(chan struct{}), make(chan struct{})
+	m.mu.Lock()
+	m.stop, m.done = stop, done
+	m.mu.Unlock()
+	m.startRefreshLoop(cfg, mgr, cfg.Catalog.RefreshInterval, stop, done)
+	m.startKeyFilePoll(stop)
+	if m.bridge != nil {
+		_ = m.bridge.Log("info", "opencode-go: api-keys-file reloaded and applied",
+			map[string]any{"key_count": len(keys)})
+	}
+}
+
+// sameAPIKeys reports whether two key sets are identical in order and labels.
+func sameAPIKeys(a, b []config.APIKey) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Value != b[i].Value || a[i].Name != b[i].Name {
+			return false
+		}
+	}
+	return true
 }
 
 // Credential lifecycle: configured keys are probed at register/reconfigure,
@@ -445,6 +554,35 @@ type authFileRecord struct {
 	Label    string `json:"label"`
 	APIKey   string `json:"api_key"`
 	Disabled bool   `json:"disabled,omitempty"`
+}
+
+// refreshAuth re-validates a static key during a host-scheduled refresh.
+// A 401 disables the credential; a healthy or inconclusive probe leaves the
+// host-managed state untouched.
+func (m *Manager) refreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) pluginapi.AuthRefreshResponse {
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	auth := pluginapi.AuthData{
+		Provider: req.AuthProvider, ID: req.AuthID, StorageJSON: req.StorageJSON,
+		Metadata: req.Metadata, Attributes: req.Attributes,
+	}
+	key := strings.TrimSpace(req.Attributes["api_key"])
+	if key != "" {
+		switch m.probeCredential(ctx, cfg, key) {
+		case credentialRejected:
+			auth.Disabled = true
+			if m.bridge != nil {
+				_ = m.bridge.Log("error", fmt.Sprintf(
+					"opencode-go: credential rejected by upstream (401) for key fingerprint %s during periodic refresh; impact: credential disabled; action: rotate the API key",
+					keyFingerprint(key)),
+					map[string]any{"key_fingerprint": keyFingerprint(key), "reason": "credential-rejected", "disabled": true})
+			}
+		case credentialHealthy:
+			// Do not clear a host-managed disabled flag from a refresh.
+		}
+	}
+	return pluginapi.AuthRefreshResponse{Auth: auth, NextRefreshAfter: time.Now().Add(credentialRefreshInterval)}
 }
 
 // materializeAuthRecords makes CPA-visible auth files idempotently. Configured
