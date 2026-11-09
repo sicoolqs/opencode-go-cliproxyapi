@@ -370,6 +370,7 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 
 	m.startRefreshLoop(cfg, mgr, interval, stop, done)
 	m.startKeyFilePoll(stop)
+	m.startHealthCheckLoop(stop)
 	return registrationEnvelope(), nil
 }
 
@@ -459,6 +460,7 @@ func (m *Manager) applyAPIKeys(keys []config.APIKey) {
 	m.mu.Unlock()
 	m.startRefreshLoop(cfg, mgr, cfg.Catalog.RefreshInterval, stop, done)
 	m.startKeyFilePoll(stop)
+	m.startHealthCheckLoop(stop)
 	if m.bridge != nil {
 		_ = m.bridge.Log("info", "opencode-go: api-keys-file reloaded and applied",
 			map[string]any{"key_count": len(keys)})
@@ -556,9 +558,11 @@ type authFileRecord struct {
 	Disabled bool   `json:"disabled,omitempty"`
 }
 
-// refreshAuth re-validates a static key during a host-scheduled refresh.
-// A 401 disables the credential; a healthy or inconclusive probe leaves the
-// host-managed state untouched.
+// refreshAuth re-validates a static key during a host-triggered refresh
+// (error-driven retry or a manual refresh; the auto-refresh scheduler never
+// schedules API-key-kind credentials). A 401 disables the credential; any
+// other probe outcome echoes the persisted disabled flag instead of resetting
+// it, so a refresh response can never silently re-enable a credential.
 func (m *Manager) refreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequest) pluginapi.AuthRefreshResponse {
 	m.mu.RLock()
 	cfg := m.cfg
@@ -566,6 +570,7 @@ func (m *Manager) refreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequ
 	auth := pluginapi.AuthData{
 		Provider: req.AuthProvider, ID: req.AuthID, StorageJSON: req.StorageJSON,
 		Metadata: req.Metadata, Attributes: req.Attributes,
+		Disabled: storedAuthDisabled(req.StorageJSON),
 	}
 	key := strings.TrimSpace(req.Attributes["api_key"])
 	if key != "" {
@@ -574,15 +579,82 @@ func (m *Manager) refreshAuth(ctx context.Context, req pluginapi.AuthRefreshRequ
 			auth.Disabled = true
 			if m.bridge != nil {
 				_ = m.bridge.Log("error", fmt.Sprintf(
-					"opencode-go: credential rejected by upstream (401) for key fingerprint %s during periodic refresh; impact: credential disabled; action: rotate the API key",
+					"opencode-go: credential rejected by upstream (401) for key fingerprint %s during refresh; impact: credential disabled; action: rotate the API key",
 					keyFingerprint(key)),
 					map[string]any{"key_fingerprint": keyFingerprint(key), "reason": "credential-rejected", "disabled": true})
 			}
-		case credentialHealthy:
-			// Do not clear a host-managed disabled flag from a refresh.
+		case credentialHealthy, credentialUnknown:
+			// Keep the echoed disabled state: only a definitive rejection
+			// flips it, and never from disabled back to enabled.
 		}
 	}
 	return pluginapi.AuthRefreshResponse{Auth: auth, NextRefreshAfter: time.Now().Add(credentialRefreshInterval)}
+}
+
+// storedAuthDisabled reads the persisted disabled flag from a credential's
+// StorageJSON. Hosts before v8.0.61 do not preserve the disabled flag across
+// refresh responses (preserveAuthDisabledState is new there), so echoing the
+// stored value is what keeps a disabled credential disabled on old hosts too.
+func storedAuthDisabled(raw []byte) bool {
+	var rec authFileRecord
+	if json.Unmarshal(raw, &rec) != nil {
+		return false
+	}
+	return rec.Disabled
+}
+
+// credentialCheckTimeout bounds one background credential health run: probes
+// run concurrently, so one probe timeout plus auth-file I/O is the practical
+// bound.
+const credentialCheckTimeout = 30 * time.Second
+
+// startHealthCheckLoop drives the periodic credential health check from inside
+// the plugin. The host auto-refresh loop never schedules auth.refresh for
+// API-key-kind credentials (nextRefreshCheckAt drops AuthKindAPIKey before the
+// refresh_interval_seconds branch is reached), so without this loop a key
+// that turns invalid after registration stays scheduled until a request 401s.
+// The cadence matches the credentialRefreshInterval reported to the host.
+func (m *Manager) startHealthCheckLoop(stop <-chan struct{}) {
+	if m.bridge == nil {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(credentialRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				m.runHealthCheckOnce()
+			}
+		}
+	}()
+}
+
+// runHealthCheckOnce re-probes every configured key and reconciles credential
+// files (disable rejected, re-enable recovered, retire removed). It reports
+// whether a run completed. Runs are skipped while a lifecycle sequence or a
+// previous run holds lifeMu; register/reconfigure already probe synchronously.
+func (m *Manager) runHealthCheckOnce() bool {
+	if !m.lifeMu.TryLock() {
+		return false
+	}
+	defer m.lifeMu.Unlock()
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	if len(cfg.APIKeys) == 0 || m.bridge == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), credentialCheckTimeout)
+	defer cancel()
+	if err := m.materializeAuthRecords(ctx, cfg); err != nil {
+		_ = m.bridge.Log("warn", "opencode-go: periodic credential check failed",
+			map[string]any{"reason": "materialize-failed"})
+		return false
+	}
+	return true
 }
 
 // materializeAuthRecords makes CPA-visible auth files idempotently. Configured

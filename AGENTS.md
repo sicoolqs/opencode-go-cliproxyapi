@@ -74,7 +74,7 @@ OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证
 - **最后凭证保护**：全部 Key 都探测失败时不禁用最后一个，否则 CPA 会因空池返回 503。
 - **凭证身份 = Key 哈希**（`authIDFor` = `opencode-go-key-<sha256>`）。Host 对 `Disabled` 是单向保留的（`preserveAuthDisabledState`），因此「换 Key」必须表现为「新凭证 ID」，不能靠复用旧 ID 复位禁用状态。
 - **旧凭证回收**：`materializeAuthRecords` 会把配置中已移除 Key 对应的凭证置为 `disabled`（文件保留，供人工删除），避免过期 Key 继续参与调度。
-- **周期体检**：`auth.parse` 必须在 `Attributes` 里写 `refresh_interval_seconds`（当前 900）并返回 `NextRefreshAfter`，Host 才会调度 `auth.refresh`；`auth.refresh` 只做有效性校验与必要的禁用，健康时不要清除 Host 管理的禁用位。
+- **周期体检**：**由插件自驱动**（`startHealthCheckLoop`，每 15 分钟复用 `materializeAuthRecords` 的探测+对账）。CPA 的 auto-refresh 循环**不会调度 API-key 类凭证**（`nextRefreshCheckAt` 在 `refresh_interval_seconds` 分支之前就把 `AuthKindAPIKey` 摘除），所以不要依赖宿主调度做周期检查；`auth.refresh` 处理器只为请求 401 触发的错误驱动刷新和手动刷新服务。`auth.refresh` 的响应必须回填 `StorageJSON` 里的 `disabled`（v8.0.61 起 Host 才有 `preserveAuthDisabledState`，旧宿主会直接采信响应中的 Disabled），只有 401 才能把 Disabled 翻成 true，任何路径都不得把它翻回 false。
 - **去重/状态归属**：需要跨 `register` / `reconfigure` 存活的状态（诊断去重、凭证集合）放在插件 `Manager`，不要放进每次重建的 `catalog.Manager`。
 - **密钥轮换**：`api-keys-file` 与内联 `api-keys` 合并、按值去重（内联名称优先）；文件按 `api-keys-file-poll`（默认 1m，最小 10s）重读，内容变化才应用，并重启目录刷新循环使新 Key 生效。轮换流程是「先加新 Key → 等生效 → 再删旧 Key」。
 
@@ -99,7 +99,7 @@ OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11 已对照最新 release v8.0.61 重跑审计：ABI/Schema/方法集零变化，`server_management.go` 未变，全部 wire 差异为可选新增字段（`multi_auth_providers`、identifier `entries`、`UsageDetail` 可选细分字段、`Error.ErrorCode()`），无需同步修改即可兼容；`go.mod` 继续 pin v8.0.50。** 适配新版 CPA 时按本清单重跑合规审计。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 
@@ -123,5 +123,8 @@ CPA 仓库 `AGENTS.md` 声称 `/v0/management` 已废弃——那**仅针对内�
 
 ### 已知行为差异（勿重复排查）
 
+- **API-key 类凭证不会被 auto-refresh 调度**（v8.0.50 与 v8.0.61 均如此）：`sdk/cliproxy/auth/auto_refresh_loop.go` 的 `nextRefreshCheckAt` 在 `authPreferredInterval`（`refresh_interval_seconds` 的消费点）之前就返回 false 摘除 `AuthKindAPIKey`，`handleDueAuth` 对 `!shouldSchedule` 直接 `remove` 不执行刷新。因此带 `api_key` 属性的凭证永远不会收到周期性 `auth.refresh`——周期性健康检查必须由插件自驱动。`auth.refresh` 仍会在请求 401 的错误驱动刷新与管理界面手动刷新时到达。
+- `preserveAuthDisabledState`（refresh 响应的单向 Disabled 保留）是 **v8.0.61 新增**：v8.0.50 的 pluginhost `RefreshAuth` 会直接采信插件响应中的 `Disabled`，健康刷新响应会把已禁用凭证洗白。插件侧已通过回填 `StorageJSON.disabled` 规避，但升级审计时注意这一差异。
+
 - `host.http.do` 的请求体**没有 timeout 字段**，`timeout_ms` 会被宿主静默忽略。真实超时依赖 `host.http.operation_open` + 请求携带 `operation_id` + 超时后 `host.http.cancel`（已在 `hostbridge.go` 实现，旧版宿主自动降级为不可取消请求）
-- `plugin.quiesce` 已显式处理（返回空成功信封）；即使不处理，宿主对含 "unknown method" 的错误信封也仅记 Debug 日志（`host.go` 的 `quiesceUnsupported`）
+- `plugin.quiesce` 已显式处理（返回空成功信封）。v8.0.61 起宿主为 quiesce 引入 needsRecovery 状态机（`callQuiesceWithOutcome`）：quiesce 失败/不支持的插件在热替换回滚时会被标记需要恢复；由于本插件正确响应成功信封，行为不受影响，但若未来移除该处理器需重新验证热替换流程。

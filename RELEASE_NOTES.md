@@ -3,7 +3,7 @@
 ### 改进
 
 - 新增 `api-keys-file` / `api-keys-file-poll`：外部密钥文件与内联 `api-keys` 合并，定期重读并自动应用（新增启用、移除禁用），轮换无需重启。
-- `auth.refresh` 定期体检：`auth.parse` 声明 15m 刷新周期，探测 401 时自动禁用凭证。
+- 凭证周期体检：插件内置 15 分钟自驱动健康检查（CPA 的 auto-refresh 循环不调度 API-key 类凭证，`auth.refresh` 仅由请求 401 或手动刷新触发），周期探测每个 Key：401 自动禁用、恢复后自动重新启用；`auth.refresh` 处理器回填存储的 `disabled` 状态，刷新响应不会把已禁用凭证洗白（兼容 v8.0.61 之前的宿主）。
 - `executor.count_tokens` 实现：Claude 源请求代理到上游 Anthropic `count_tokens`，避免 Claude Code 持续 400。
 - 凭证健康检查：注册/重配置时探测每个 Key（`GET {usage-url}`），401 的凭证自动禁用并记录指纹；最后一个可用 Key 失效时保留启用，避免 503 空池。
 - 旧凭证隔离：配置中已移除的 Key 对应凭证自动 `disabled`，不再参与调度；文件保留可手工删除。

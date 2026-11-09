@@ -12,7 +12,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// credentialRefreshInterval is how often the host re-checks a static API key.
+// credentialRefreshInterval is how often credential health is re-checked.
+// The plugin drives this cadence itself via startHealthCheckLoop (the host
+// auto-refresh loop never schedules auth.refresh for API-key-kind
+// credentials); the same value is reported to the host through
+// refresh_interval_seconds and NextRefreshAfter.
 const credentialRefreshInterval = 15 * time.Minute
 
 // authProvider implements the pluginapi.AuthProvider contract.
@@ -52,8 +56,10 @@ func (p authProvider) ParseAuth(_ context.Context, req pluginapi.AuthParseReques
 		Provider: ProviderID, ID: raw.ID, FileName: req.FileName, Label: accountLabel(p.cfg, raw.APIKey, raw.Label, 0), StorageJSON: req.RawJSON, Disabled: raw.Disabled,
 		Attributes: map[string]string{
 			"api_key": raw.APIKey,
-			// The host schedules auth.refresh from this attribute; the probe
-			// then re-validates a static key without spending tokens.
+			// Reported so host-driven refreshes (error-driven retry, manual
+			// refresh) honor the plugin's cadence. The auto-refresh scheduler
+			// itself never schedules API-key-kind credentials — the plugin
+			// runs its own health-check loop instead.
 			"refresh_interval_seconds": strconv.Itoa(int(credentialRefreshInterval.Seconds())),
 		},
 		NextRefreshAfter: time.Now().Add(credentialRefreshInterval),
