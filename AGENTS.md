@@ -57,13 +57,9 @@ $text = [System.Text.Encoding]::ASCII.GetString($bytes)
 
 ### 代理环境注意
 
-本机全局环境变量 `HTTP_PROXY`/`HTTPS_PROXY` 使用了 `https://` 方案，会导致 Git Credential Manager 报
-`ServicePointManager 不支持具有 https 方案的代理` 而中断推送。需要 git 网络操作时，临时覆盖：
+当前机器的 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量已设置为网关代理（`https://…@ai-gateway.shieh.xin:57890`）。**环境变量已设置代理时，优先使用环境变量的代理，不要清除或覆盖它**：直连 github.com 会被阻断，旧的本地代理 `http://127.0.0.1:7890` 已不再运行。
 
-```powershell
-$env:HTTP_PROXY = "http://127.0.0.1:7890"; $env:HTTPS_PROXY = "http://127.0.0.1:7890"
-git push origin main
-```
+历史教训仅作参考：早期曾因 Git Credential Manager 报 `ServicePointManager 不支持具有 https 方案的代理` 而需要临时覆盖代理；当前环境下直接沿用现有环境变量推送即可成功（凭证已缓存，GCM 不再触发该问题）。若未来推送再次报该错误，再考虑临时覆盖方案。
 
 ## 凭证生命周期约定
 
