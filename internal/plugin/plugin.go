@@ -374,6 +374,18 @@ func (m *Manager) handleLifecycle(request []byte) ([]byte, error) {
 	return registrationEnvelope(), nil
 }
 
+// recoverBackground contains a panic in a plugin-owned goroutine. Go
+// terminates the whole process on an unrecovered panic in any goroutine — and
+// this process is the CPA host, shared by every model — so background work
+// (stream pumps, polls, health checks) must never escape. The host also fuses
+// a plugin whose callback panics, so containment here keeps one bad request
+// from freezing every model.
+func (m *Manager) recoverBackground(what string) {
+	if r := recover(); r != nil && m.bridge != nil {
+		_ = m.bridge.Log("error", fmt.Sprintf("opencode-go: %s panicked; impact: contained, other models unaffected", what), nil)
+	}
+}
+
 // startKeyFilePoll re-reads api-keys-file and applies changes without a
 // restart. It exits when stop closes (reconfigure or shutdown).
 func (m *Manager) startKeyFilePoll(stop <-chan struct{}) {
@@ -395,7 +407,10 @@ func (m *Manager) startKeyFilePoll(stop <-chan struct{}) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				m.pollKeyFileOnce()
+				func() {
+					defer m.recoverBackground("api-keys-file poll")
+					m.pollKeyFileOnce()
+				}()
 			}
 		}
 	}()
@@ -626,7 +641,10 @@ func (m *Manager) startHealthCheckLoop(stop <-chan struct{}) {
 			case <-stop:
 				return
 			case <-ticker.C:
-				m.runHealthCheckOnce()
+				func() {
+					defer m.recoverBackground("credential health check")
+					m.runHealthCheckOnce()
+				}()
 			}
 		}
 	}()

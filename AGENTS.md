@@ -106,6 +106,12 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 - **Console 目录的能力假设**：`SpeaksProtocol` 对 Console 文本模型放行任意文本协议（`routing.go:86-89`），即假定网关跨 API 翻译；旧目录/非文本模型只认 `api` 声明与原生协议。这是已知的宽松点：模型即使只声明 `responses`，Chat Completions 客户端仍会被发到 chat-completions 端点。遇到「协议不匹配类」上游失败（404/405/EOF）时，先用 `route-overrides` 固定到原生协议验证。
 - **`route-overrides` 语义**：`protocol` 必填（`chat-completions` / `messages` / `responses`）；`endpoint` 可选，为空时使用该协议的默认端点；配置时按 `base-url` 拼接且沿用旧规则（前导 `/v1` 被去掉）——Console base 下必须写完整路径（如 `/openai/v1/responses`，写成 `/v1/responses` 会得到 `.../inference/go/responses`）。
 
+## 并发与故障隔离
+
+- **单模型失败不应升级为插件级故障**：路由、转换、会话都是请求内状态，模型级错误用 `model_not_found` 等 code 控制冷却范围；不要引入跨模型的可变全局状态。
+- **宿主 `fusePlugin` 只由 panic 触发**，作用域是整个插件（所有模型/凭证/管理接口），恢复需重载插件或重启。因此插件不得把 panic 抛回宿主：RPC 边界由 `HandleCall` recover，后台 goroutine 必须用 `recoverBackground` 包住（stream pump / 密钥文件轮询 / 周期体检 / 目录刷新）。
+- Go 中任意 goroutine 的未捕获 panic 会终止整个进程（即 CPA 宿主），影响面是全部模型；**新增后台 goroutine 时必须带 recover**。
+
 ## 日志与诊断约定
 
 - **原因必须写进 message**：CPA 默认日志格式不展示 `host.log` 的 fields，只把 fields 当结构化补充；若原因只在 fields 里，线上等同于丢失。

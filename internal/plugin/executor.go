@@ -583,6 +583,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		if m.bridge != nil {
 			defer m.bridge.inFlight.Done()
 		}
+		defer m.recoverBackground("stream pump")
 		m.pumpStream(downID, id, res, req.SourceFormat, decision.UpstreamProtocol)
 	}()
 	return okEnvelope(struct{}{}), nil

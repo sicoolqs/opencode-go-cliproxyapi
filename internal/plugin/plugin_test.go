@@ -1300,3 +1300,31 @@ func mustHandle(t *testing.T, m *Manager, method string, req []byte) []byte {
 	}
 	return resp
 }
+
+// A panic inside a plugin-owned goroutine must be contained: an unrecovered
+// panic would terminate the CPA process (every model), and the host fuses a
+// plugin whose callback panics.
+func TestRecoverBackgroundContainsPanic(t *testing.T) {
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		func() {
+			defer m.recoverBackground("test work")
+			panic("boom")
+		}()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("panic containment did not return")
+	}
+	logs := f.callsOf(pluginabi.MethodHostLog)
+	if len(logs) != 1 || !strings.Contains(string(logs[0].payload), "test work") {
+		t.Fatalf("panic was not logged: %v", logs)
+	}
+	if !strings.Contains(string(logs[0].payload), "other models unaffected") {
+		t.Errorf("log must state the containment impact: %s", logs[0].payload)
+	}
+}
