@@ -406,10 +406,23 @@ func (b *HostBridge) StreamEmit(downstreamStreamID string, payload []byte) error
 // redacted error label. Bounded by emitTimeout like StreamEmit: on a wedged
 // downstream consumer the close itself is what must not block.
 func (b *HostBridge) StreamCloseDownstream(downstreamStreamID string, errMsg string) error {
+	return b.streamCloseDownstream(downstreamStreamID, errMsg, nil)
+}
+
+// StreamCloseDownstreamWithDetail terminates a downstream stream with a
+// structured error so the host can classify the failure for cooldown and retry
+// decisions (stream_truncated, request_scoped, ...). Hosts before v8.0.62
+// ignore the extra field and fall back to the message.
+func (b *HostBridge) StreamCloseDownstreamWithDetail(downstreamStreamID string, detail pluginabi.Error) error {
+	return b.streamCloseDownstream(downstreamStreamID, detail.Message, &detail)
+}
+
+func (b *HostBridge) streamCloseDownstream(downstreamStreamID, errMsg string, detail *pluginabi.Error) error {
 	req := struct {
-		StreamID string `json:"stream_id"`
-		Error    string `json:"error,omitempty"`
-	}{downstreamStreamID, errMsg}
+		StreamID    string           `json:"stream_id"`
+		Error       string           `json:"error,omitempty"`
+		ErrorDetail *pluginabi.Error `json:"error_detail,omitempty"`
+	}{downstreamStreamID, errMsg, detail}
 	ctx, cancel := context.WithTimeout(context.Background(), emitTimeout)
 	defer cancel()
 	_, err := b.invoke(ctx, pluginabi.MethodHostStreamClose, req, "host stream close")

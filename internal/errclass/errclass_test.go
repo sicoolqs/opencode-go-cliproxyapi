@@ -77,13 +77,65 @@ func TestFromNetwork(t *testing.T) {
 		e.Message != "dial tcp: refused" {
 		t.Errorf("FromNetwork(err) = %+v", e)
 	}
+	// Pre-first-byte transport failures carry the host-recognized code so CPA
+	// does not cool a healthy credential for an upstream EOF/reset.
+	if e.Code != CodeTransientTransport {
+		t.Errorf("FromNetwork(err) code = %q, want %q", e.Code, CodeTransientTransport)
+	}
 	timeout := FromNetwork(errors.New("host call host.http.do_stream timed out"))
 	if timeout.StatusCode != 504 {
 		t.Errorf("FromNetwork(timeout) status = %d, want 504", timeout.StatusCode)
 	}
+	if timeout.Code != "" {
+		t.Errorf("FromNetwork(timeout) code = %q, want status-based fallback", timeout.Code)
+	}
 	nilErr := FromNetwork(nil)
 	if nilErr.Message != "" || !nilErr.Retryable {
 		t.Errorf("FromNetwork(nil) = %+v", nilErr)
+	}
+}
+
+func TestHostRecognizedCodes(t *testing.T) {
+	if got := FromStatus(404, "model retired"); got.Code != CodeModelNotFound {
+		t.Errorf("404 code = %q, want %q", got.Code, CodeModelNotFound)
+	}
+	if got := FromStatus(429, "quota exceeded"); got.Code != CodeCredentialQuota {
+		t.Errorf("429 quota code = %q, want %q", got.Code, CodeCredentialQuota)
+	}
+	if got := FromStatus(429, "too many requests"); got.Code != "" {
+		t.Errorf("429 plain code = %q, want empty (status-based quota path)", got.Code)
+	}
+	if got := PostFirstByteNetwork("read tcp: connection reset"); got.Code != CodeStreamTruncated {
+		t.Errorf("post-first-byte code = %q, want %q", got.Code, CodeStreamTruncated)
+	}
+	if got := Translation("malformed request"); got.Code != CodeRequestScoped {
+		t.Errorf("translation code = %q, want %q", got.Code, CodeRequestScoped)
+	}
+	if got := NotImplemented("unsupported here"); got.Code != CodeNotImplemented || got.StatusCode != 501 {
+		t.Errorf("not-implemented = %+v, want code %q status 501", got, CodeNotImplemented)
+	}
+}
+
+func TestToEnvelopeErrorCodes(t *testing.T) {
+	// Request-level classes without an explicit code become request_scoped so a
+	// malformed client request cannot cool a credential.
+	for _, class := range []Class{ClassUnsupported, ClassTranslation} {
+		env := ToEnvelopeError(&Error{Class: class, Message: "bad request"})
+		if env.Code != CodeRequestScoped {
+			t.Errorf("class %q envelope code = %q, want %q", class, env.Code, CodeRequestScoped)
+		}
+	}
+	env := ToEnvelopeError(NotImplemented("nope"))
+	if env.Code != CodeNotImplemented || env.HTTPStatus != 501 {
+		t.Errorf("not-implemented envelope = %+v", env)
+	}
+	env = ToEnvelopeError(FromNetwork(errors.New("EOF")))
+	if env.Code != CodeTransientTransport || env.HTTPStatus != 502 {
+		t.Errorf("transport envelope = %+v", env)
+	}
+	env = ToEnvelopeError(&Error{Class: ClassAuth, Message: "bad key", StatusCode: 401})
+	if env.Code != string(ClassAuth) {
+		t.Errorf("auth envelope code = %q, want %q", env.Code, ClassAuth)
 	}
 }
 
@@ -136,17 +188,18 @@ func TestToEnvelopeError(t *testing.T) {
 		t.Errorf("ToEnvelopeError = %+v, want %+v", got, want)
 	}
 
-	// Issue #2: ClassUnsupported and ClassTranslation with StatusCode 0 default to 400.
+	// Request-level classes with StatusCode 0 default to 400 and the
+	// host-recognized request_scoped code (no credential cooldown/rotation).
 	unsupported := &Error{Class: ClassUnsupported, Message: "unsupported input"}
 	got = ToEnvelopeError(unsupported)
-	if got.HTTPStatus != 400 || got.Code != "unsupported_protocol_or_parameter" {
-		t.Errorf("ToEnvelopeError(unsupported) = %+v, want HTTPStatus 400", got)
+	if got.HTTPStatus != 400 || got.Code != CodeRequestScoped {
+		t.Errorf("ToEnvelopeError(unsupported) = %+v, want HTTPStatus 400 + %q", got, CodeRequestScoped)
 	}
 
 	translation := Translation("cannot map tool calls")
 	got = ToEnvelopeError(translation)
-	if got.HTTPStatus != 400 || got.Code != "translation_failure" {
-		t.Errorf("ToEnvelopeError(translation) = %+v, want HTTPStatus 400", got)
+	if got.HTTPStatus != 400 || got.Code != CodeRequestScoped {
+		t.Errorf("ToEnvelopeError(translation) = %+v, want HTTPStatus 400 + %q", got, CodeRequestScoped)
 	}
 
 	// Explicit status code is preserved.

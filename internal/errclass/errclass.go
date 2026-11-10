@@ -31,9 +31,44 @@ const (
 	ClassTranslation  Class = "translation_failure"
 )
 
+// Host-recognized pluginabi error codes (CLIProxyAPI v8.0.62+). They are
+// defined locally so the plugin keeps its v8.0.50 SDK pin: older hosts ignore
+// unknown codes and fall back to HTTP-status behavior, newer hosts use them to
+// decide credential/model cooldown and request retries.
+//
+//   - CodeTransientTransport: pre-HTTP dial/TLS/DNS/reset/EOF failure. Skips
+//     credential cooldown and stays eligible for request retries; without it a
+//     plain 502 cools the credential for the transient-error window.
+//   - CodeStreamTruncated: an accepted upstream stream ended without a
+//     completion frame. Skips credential cooldown and forbids replaying the
+//     request on another credential (the generation was already submitted).
+//   - CodeRequestScoped: the failure belongs to the request (translation,
+//     unsupported parameter), so CPA skips cooldown and stops rotation.
+//   - CodeConnectionLifecycle: the downstream client disconnected or the
+//     stream session closed; CPA skips cooldown but keeps credential rotation.
+//   - CodeModelNotFound: cool only the requested model instead of the whole
+//     credential for 12h.
+//   - CodeNotImplemented: optional capability (count_tokens) unsupported;
+//     availability-neutral for the credential and model.
+//   - CodeCredentialQuota: a 429/402 that exhausts the entire credential
+//     across all models.
+const (
+	CodeTransientTransport  = "transient_transport"
+	CodeStreamTruncated     = "stream_truncated"
+	CodeRequestScoped       = "request_scoped"
+	CodeConnectionLifecycle = "connection_lifecycle"
+	CodeModelNotFound       = "model_not_found"
+	CodeNotImplemented      = "not_implemented"
+	CodeCredentialQuota     = "credential_quota"
+)
+
 // Error describes classified request errors and retryability for CPA execution.
 type Error struct {
-	Class             Class
+	Class Class
+	// Code overrides the envelope error code with a host-recognized value.
+	// Empty falls back to the Class-derived code (or request_scoped for
+	// request-level classes).
+	Code              string
 	Message           string
 	StatusCode        int
 	Retryable         bool
@@ -79,9 +114,17 @@ func FromStatus(status int, message string, headers ...http.Header) *Error {
 	case 402:
 		return &Error{Class: quotaClass(ClassBilling), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	case 404:
-		return &Error{Class: ClassInvalidModel, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
+		// A retired/unknown model must cool only that model; a plain 404 would
+		// otherwise take the whole credential out for 12 hours on newer hosts.
+		return &Error{Class: ClassInvalidModel, Code: CodeModelNotFound, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
 	case 429:
-		return &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
+		e := &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
+		if quota {
+			// Explicit whole-credential quota refusal; the code keeps the scope
+			// across RPC envelopes and stream error details.
+			e.Code = CodeCredentialQuota
+		}
+		return e
 	}
 	if status >= 500 {
 		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
@@ -121,18 +164,23 @@ func RetryAfterFromHeaders(h http.Header) int {
 
 // FromNetwork classifies a PRE-first-byte network/timeout failure. Timeouts
 // surface as 504 and other transport failures as 502, so clients see a
-// retryable gateway error instead of an opaque 500. Failures observed after
-// the first upstream byte must use PostFirstByteNetwork instead.
+// retryable gateway error instead of an opaque 500. Non-timeout transport
+// failures carry the host-recognized transient_transport code so CPA does not
+// cool a healthy credential for an upstream reset/EOF; timeouts keep the
+// status-based transient cooldown. Failures observed after the first upstream
+// byte must use PostFirstByteNetwork instead.
 func FromNetwork(err error) *Error {
 	msg := ""
 	if err != nil {
 		msg = Redact(err.Error())
 	}
 	status := http.StatusBadGateway
+	code := CodeTransientTransport
 	if isTimeoutError(err) {
 		status = http.StatusGatewayTimeout
+		code = ""
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true, StatusCode: status}
+	return &Error{Class: ClassNetwork, Code: code, Message: msg, Retryable: true, StatusCode: status}
 }
 
 // isTimeoutError reports whether err represents a deadline/timeout.
@@ -156,14 +204,26 @@ func isTimeoutError(err error) bool {
 // PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
 // first upstream byte was received: part of the response may already be
 // delivered downstream, so a retry would risk duplicate delivery of a half
-// stream — never retryable (§7).
+// stream — never retryable (§7). The stream_truncated code additionally tells
+// the host to skip credential cooldown and never replay the request on another
+// credential, because the generation was already submitted upstream.
 func PostFirstByteNetwork(msg string) *Error {
-	return &Error{Class: ClassNetwork, Message: Redact(msg), Retryable: false}
+	return &Error{Class: ClassNetwork, Code: CodeStreamTruncated, Message: Redact(msg), Retryable: false}
 }
 
 // Translation reports an FR-005/FR-006 translation failure; never retryable.
+// It is request-scoped: no credential rotation or cooldown can fix a malformed
+// or unsupported client payload.
 func Translation(msg string) *Error {
-	return &Error{Class: ClassTranslation, Message: Redact(msg)}
+	return &Error{Class: ClassTranslation, Code: CodeRequestScoped, Message: Redact(msg)}
+}
+
+// NotImplemented reports an optional capability the plugin does not implement
+// for this source format (count_tokens outside claude). The code keeps the
+// credential and model availability-neutral on newer hosts; 501 keeps the
+// same meaning on older hosts.
+func NotImplemented(msg string) *Error {
+	return &Error{Class: ClassUnsupported, Code: CodeNotImplemented, Message: Redact(msg), StatusCode: http.StatusNotImplemented}
 }
 
 // UpstreamFallback builds a ClassUpstream error for the adapter fallback
@@ -178,8 +238,21 @@ func UpstreamFallback(msg string) *Error {
 // message. Re-redacting at the envelope edge is INTENTIONAL defense-in-depth:
 // constructors already redact (so non-envelope consumers — logs, executor
 // fail paths reading .Message directly) are safe, and Redact is idempotent.
+//
+// Request-level classes (unsupported parameter, translation failure) default
+// to the host-recognized request_scoped code so a malformed client request
+// cannot cool a healthy credential or trigger pointless rotation.
 func ToEnvelopeError(e *Error) pluginabi.Error {
 	status := e.StatusCode
+	code := e.Code
+	if code == "" {
+		switch e.Class {
+		case ClassUnsupported, ClassTranslation:
+			code = CodeRequestScoped
+		default:
+			code = string(e.Class)
+		}
+	}
 	if status == 0 {
 		switch e.Class {
 		case ClassUnsupported, ClassTranslation:
@@ -187,7 +260,7 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 		}
 	}
 	return pluginabi.Error{
-		Code:              string(e.Class),
+		Code:              code,
 		Message:           Redact(e.Message),
 		Retryable:         e.Retryable,
 		HTTPStatus:        status,

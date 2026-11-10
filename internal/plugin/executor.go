@@ -143,10 +143,7 @@ func (m *Manager) handleCountTokens(request []byte) ([]byte, error) {
 		return failEnv, nil
 	}
 	if strings.ToLower(strings.TrimSpace(req.SourceFormat)) != "claude" {
-		return classEnvelope(&errclass.Error{
-			Class:   errclass.ClassUnsupported,
-			Message: "executor.count_tokens is implemented for the claude source format only",
-		}), nil
+		return classEnvelope(errclass.NotImplemented("executor.count_tokens is implemented for the claude source format only")), nil
 	}
 	sessionID, eErr := resolveOpenCodeSessionID(req)
 	if eErr != nil {
@@ -471,6 +468,11 @@ func classEnvelope(e *errclass.Error) []byte {
 // operator-configured shorter value still wins.
 var streamStartTimeout = 60 * time.Second
 
+// statusClientClosedRequest is the conventional non-standard status for a
+// downstream client that disconnected before the stream completed. The stream
+// response is already committed, so the status is diagnostic only.
+const statusClientClosedRequest = 499
+
 // streamIdleTimeout returns the idle deadline applied between upstream chunks.
 func streamIdleTimeout(cfg config.Config) time.Duration {
 	if cfg.RequestTimeout > 0 {
@@ -588,11 +590,29 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 
 func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string, upstreamProtocol catalog.Route) {
 	var closeOnce sync.Once
-	closeStreams := func(downErrMsg string) {
+	closeWith := func(errMsg string, detail *pluginabi.Error) {
 		closeOnce.Do(func() {
 			_ = m.bridge.StreamClose(upstreamID)
-			_ = m.bridge.StreamCloseDownstream(downID, downErrMsg)
+			if detail != nil {
+				_ = m.bridge.StreamCloseDownstreamWithDetail(downID, *detail)
+				return
+			}
+			_ = m.bridge.StreamCloseDownstream(downID, errMsg)
 		})
+	}
+	closeStreams := func(errMsg string) { closeWith(errMsg, nil) }
+	// closeWithCode attaches a host-recognized code to a stream failure so CPA
+	// can classify it for cooldown/retry decisions. status stays non-zero
+	// because a zero HTTPStatus is surfaced as 500.
+	closeWithCode := func(code, errMsg string, status int) {
+		msg := errclass.Redact(errMsg)
+		closeWith(msg, &pluginabi.Error{Code: code, Message: msg, HTTPStatus: status})
+	}
+	// truncated ends a stream that the upstream accepted but did not complete.
+	// The generation was already submitted, so the host must skip credential
+	// cooldown and must not replay the request on another credential.
+	truncated := func(errMsg string, status int) {
+		closeWithCode(errclass.CodeStreamTruncated, errMsg, status)
 	}
 	defer closeStreams("")
 
@@ -620,15 +640,15 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		debugTrace("executor stream read chunk_len=%d closed=%t readErrMsg=%q err=%v", len(payload), closed, readErrMsg, err)
 		upstreamClosed = closed
 		if aborted.Load() {
-			closeStreams(errclass.Redact("stream exceeded request-timeout"))
+			truncated("stream exceeded request-timeout", http.StatusGatewayTimeout)
 			return
 		}
 		if err != nil {
-			closeStreams(errclass.Redact(err.Error()))
+			truncated(err.Error(), http.StatusBadGateway)
 			return
 		}
 		if readErrMsg != "" {
-			closeStreams(errclass.Redact(readErrMsg))
+			truncated(readErrMsg, http.StatusBadGateway)
 			return
 		}
 		// Reset the idle watchdog on every upstream chunk: long but active
@@ -638,16 +658,18 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		}
 		total += int64(len(payload))
 		if total > res.cfg.MaxResponseBytes {
-			closeStreams(errclass.Redact("stream exceeded max-response-bytes"))
+			truncated("stream exceeded max-response-bytes", http.StatusBadGateway)
 			return
 		}
 		events, done, convErr := conv.Feed(payload)
 		if convErr != nil {
-			closeStreams(errclass.Redact(convErr.Message))
+			closeWithCode(errclass.CodeRequestScoped, convErr.Message, http.StatusBadRequest)
 			return
 		}
 		if emitErr := m.emitAll(downID, events); emitErr != nil {
-			closeStreams(errclass.Redact(emitErr.Error()))
+			// Downstream consumer gone or not draining: a client/session
+			// lifecycle failure, never a credential fault.
+			closeWithCode(errclass.CodeConnectionLifecycle, emitErr.Error(), statusClientClosedRequest)
 			return
 		}
 		convDone = done

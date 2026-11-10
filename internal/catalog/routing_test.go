@@ -107,6 +107,28 @@ func TestResolveRouteOverrideWins(t *testing.T) {
 	}
 }
 
+// An override without an endpoint uses the protocol's configured endpoint
+// instead of joining a path onto base-url.
+func TestResolveRouteOverrideUsesProtocolEndpoint(t *testing.T) {
+	cfg := routeCfg(config.RoutingPreferClient)
+	cfg.RouteOverrides = map[string]config.RouteOverride{
+		"muse-spark-1.3-contributor": {Protocol: "responses"},
+	}
+	decision, eErr := ResolveRoute(cfg, consoleRecord("muse-spark-1.3-contributor", RouteResponses), RouteChatCompletions)
+	if eErr != nil {
+		t.Fatalf("ResolveRoute: %v", eErr)
+	}
+	if decision.UpstreamProtocol != RouteResponses {
+		t.Fatalf("override ignored: %+v", decision)
+	}
+	if decision.UpstreamURL != cfg.Endpoints.Responses {
+		t.Errorf("url = %q, want the configured responses endpoint %q", decision.UpstreamURL, cfg.Endpoints.Responses)
+	}
+	if !decision.ConversionNeeded {
+		t.Error("client chat-completions -> responses must require conversion")
+	}
+}
+
 // T09: a protocol the model cannot serve falls back to native when
 // translation is allowed, and fails explicitly when it is not.
 func TestResolveRouteUnsupportedClientProtocol(t *testing.T) {

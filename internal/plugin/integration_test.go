@@ -17,6 +17,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/config"
+	"opencode-go-cliproxyapi/internal/errclass"
 )
 
 // forwardingBridge bridges only the C boundary: host.http.do performs REAL
@@ -925,7 +926,7 @@ func TestExecuteNativePassthroughMalformedUpstream(t *testing.T) {
 	st.setMessagesBody("{definitely not json")
 	env := mustExecute(t, m, "opencode-go/qwen3.7-max", "claude",
 		[]byte(`{"model":"opencode-go/qwen3.7-max","max_tokens":32,"messages":[{"role":"user","content":"hi"}]}`))
-	if env.OK || env.Error == nil || env.Error.Code != "translation_failure" {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }
@@ -1047,7 +1048,7 @@ func TestResponsesUnsupportedFeatureDescriptive(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != "unsupported_protocol_or_parameter" {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("envelope = %s", resp)
 	}
 	if !strings.Contains(env.Error.Message, "web_search") || !strings.Contains(env.Error.Message, "/v1/responses") {

@@ -12,6 +12,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/config"
+	"opencode-go-cliproxyapi/internal/errclass"
 )
 
 // countTokensResponder answers catalog, credential probes and the Anthropic
@@ -98,8 +99,10 @@ func TestCountTokensRejectsNonClaudeFormat(t *testing.T) {
 	raw, _ := m.HandleCall(pluginabi.MethodExecutorCountTokens,
 		execReqBody("opencode-go/glm-5.3", "openai", []byte(`{"model":"x","messages":[]}`), false))
 	env := decodeEnv(t, raw)
-	if env.OK || env.Error == nil || env.Error.Code != "unsupported_protocol_or_parameter" {
-		t.Fatalf("envelope = %+v, want unsupported", env.Error)
+	// not_implemented + 501 keeps the credential and model availability-neutral
+	// on hosts that understand the code, and still reads as "unsupported".
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeNotImplemented || env.Error.HTTPStatus != 501 {
+		t.Fatalf("envelope = %+v, want not_implemented/501", env.Error)
 	}
 }
 

@@ -265,7 +265,7 @@ func pluginConfigFields() []pluginapi.ConfigField {
 		{
 			Name:        "route-overrides",
 			Type:        pluginapi.ConfigFieldTypeObject,
-			Description: "Explicit route overrides per model (`<model-id>: {protocol: string, endpoint: string}`).",
+			Description: "Explicit route overrides per model (`<model-id>: {protocol: chat-completions|messages|responses, endpoint?: string}`); endpoint is optional and defaults to that protocol's configured endpoint.",
 		},
 		{
 			Name:        "request-timeout",

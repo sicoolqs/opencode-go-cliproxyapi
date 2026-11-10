@@ -8,6 +8,13 @@
 - 凭证健康检查：注册/重配置时探测每个 Key（`GET {usage-url}`），401 的凭证自动禁用并记录指纹；最后一个可用 Key 失效时保留启用，避免 503 空池。
 - 旧凭证隔离：配置中已移除的 Key 对应凭证自动 `disabled`，不再参与调度；文件保留可手工删除。
 - 错误分类对齐：上游 401 改为不可重试；首字节前网络错误返回 502、超时返回 504，便于客户端与 CPA 正确收敛。
+- 适配 CPA v8.0.62+ 宿主可识别错误码：首字节前的 EOF/reset 等传输失败返回 `transient_transport`（不再让健康凭证被冷却 1 分钟）、流式中断返回 `stream_truncated`（跳过冷却且不换凭证重放）、下游断开返回 `connection_lifecycle`、翻译失败返回 `request_scoped`、上游 404 返回 `model_not_found`（只冷却模型而非凭证 12 小时）、非 claude 源 `count_tokens` 返回 `not_implemented`/501。流式失败通过 `host.stream.close` 的 `error_detail` 携带结构化错误，旧宿主自动退回纯 message。
+- `route-overrides` 简化：`endpoint` 改为可选，不配置时直接使用该协议的默认端点（`chat-completions-url` / `messages-url` / `responses-url`）；配置时仍按 `base-url` 拼接。例如把某个 Responses-only 模型固定到原生协议只需：
+  ```yaml
+  route-overrides:
+    "muse-spark-1.3-contributor":
+      protocol: "responses"
+  ```
 - 流式超时改为“首字节超时（≤60s）+ 空闲超时”，长会话不再被 5 分钟总时长截断。
 - 新增单元测试覆盖凭证禁用、最后凭证保护、旧凭证隔离、不确定探测不改状态、空闲超时重置、首字节超时 504、count_tokens 代理、周期刷新与密钥文件热应用。
 

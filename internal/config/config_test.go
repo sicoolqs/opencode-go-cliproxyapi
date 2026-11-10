@@ -417,11 +417,6 @@ func TestLoadRejections(t *testing.T) {
 			"route-overrides[bad-model].protocol: unsupported protocol",
 		},
 		{
-			"override empty endpoint",
-			"route-overrides:\n  bad-model:\n    protocol: responses\n    endpoint: \"\"\n" + withKey,
-			"route-overrides[bad-model].endpoint: must not be empty",
-		},
-		{
 			"override endpoint without leading slash",
 			"route-overrides:\n  bad-model:\n    protocol: responses\n    endpoint: v1/x\n" + withKey,
 			"route-overrides[bad-model].endpoint: must start with /",
@@ -438,6 +433,21 @@ func TestLoadRejections(t *testing.T) {
 				t.Errorf("error leaks environment reference: %q", err.Error())
 			}
 		})
+	}
+}
+
+// route-overrides.endpoint is optional: without it the protocol's configured
+// endpoint applies. Whitespace-only values are treated as unset.
+func TestLoadRouteOverrideEndpointOptional(t *testing.T) {
+	c, err := Load([]byte("route-overrides:\n  muse-spark-1.3-contributor:\n    protocol: responses\n  spaced:\n    protocol: messages\n    endpoint: \"  \"\n" + withKey))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := c.RouteOverrides["muse-spark-1.3-contributor"]; got.Protocol != "responses" || got.Endpoint != "" {
+		t.Errorf("override = %+v, want responses with empty endpoint", got)
+	}
+	if got := c.RouteOverrides["spaced"]; got.Endpoint != "" {
+		t.Errorf("whitespace endpoint = %q, want treated as unset", got.Endpoint)
 	}
 }
 

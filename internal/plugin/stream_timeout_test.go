@@ -72,6 +72,9 @@ func TestExecuteStreamIdleWatchdogResetsOnActivity(t *testing.T) {
 	if len(closes) != 1 {
 		t.Fatalf("downstream closes = %d, want 1", len(closes))
 	}
+	if strings.Contains(string(closes[0].payload), "error_detail") {
+		t.Fatalf("clean completion must not carry an error detail: %s", closes[0].payload)
+	}
 	if strings.Contains(string(closes[0].payload), `"error":"`) {
 		t.Fatalf("active stream closed with error: %s", closes[0].payload)
 	}

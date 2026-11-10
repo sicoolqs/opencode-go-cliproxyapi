@@ -348,7 +348,7 @@ func TestExecutorSessionFallbackAndMalformedInput(t *testing.T) {
 				t.Fatalf("handle: %v", err)
 			}
 			env := decodeEnv(t, resp)
-			if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassTranslation) {
+			if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 				t.Fatalf("envelope = %s", resp)
 			}
 			if len(f.callsOf(pluginabi.MethodHostHTTPDo)) != beforeDo || len(f.callsOf(pluginabi.MethodHostHTTPDoStream)) != beforeStream {
@@ -583,7 +583,7 @@ func TestExecuteStreamPreferClientClaudeUsesMessagesUpstream(t *testing.T) {
 func TestExecuteUnknownSourceFormatRejected(t *testing.T) {
 	m, f := newRoutingManager(t, "routing:\n  mode: prefer-client-protocol\n", consoleRouteCatalog)
 	env := mustExecute(t, m, "opencode-go/deepseek-v4.1-flash", "codex", []byte(`{"input":"hi"}`))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("envelope = %+v, want unsupported", env.Error)
 	}
 	for _, call := range f.callsOf(pluginabi.MethodHostHTTPDo) {
@@ -622,7 +622,7 @@ func TestExecuteUnknownModelIs404Envelope(t *testing.T) {
 func TestExecuteUnsupportedSourceFormat(t *testing.T) {
 	m, _ := newExecManager(t)
 	env := mustExecute(t, m, "opencode-go/glm-5.3", "bogus-format", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }
@@ -824,7 +824,7 @@ func TestExecuteStreamRoutedFromBothMethods(t *testing.T) {
 		if err != nil {
 			t.Fatalf("execute_stream bad format: %v", err)
 		}
-		if env := decodeEnv(t, resp); env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+		if env := decodeEnv(t, resp); env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 			t.Fatalf("bad-format execute_stream envelope = %s", resp)
 		}
 	})
@@ -1111,7 +1111,7 @@ func TestExecuteStreamOpenTransportError(t *testing.T) {
 		t.Fatalf("execute_stream: %v", err)
 	}
 	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) || !env.Error.Retryable {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeTransientTransport || !env.Error.Retryable {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostStreamEmit)); got != 0 {
@@ -1215,6 +1215,10 @@ func TestExecuteStreamEmitFailsMidstream(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
 	}
+	// A vanished downstream client is a lifecycle event, not a credential fault.
+	if !strings.Contains(string(downCloses[0].payload), errclass.CodeConnectionLifecycle) {
+		t.Fatalf("emit failure must carry connection_lifecycle detail: %s", downCloses[0].payload)
+	}
 }
 
 func TestExecuteStreamPartialLineDroppedOnCleanClose(t *testing.T) {
@@ -1275,6 +1279,9 @@ func TestExecuteStreamExceedsMaxResponseBytes(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
 	}
+	if !strings.Contains(string(downCloses[0].payload), errclass.CodeStreamTruncated) {
+		t.Fatalf("size cap must close with stream_truncated detail: %s", downCloses[0].payload)
+	}
 }
 
 func TestExecuteStreamWatchdogClosesIdleUpstream(t *testing.T) {
@@ -1323,6 +1330,10 @@ func TestExecuteStreamWatchdogClosesIdleUpstream(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
 	}
+	if !strings.Contains(string(downCloses[0].payload), errclass.CodeStreamTruncated) ||
+		!strings.Contains(string(downCloses[0].payload), `"http_status":504`) {
+		t.Fatalf("idle timeout must close with stream_truncated/504: %s", downCloses[0].payload)
+	}
 }
 
 func TestExecuteStreamReadTransportError(t *testing.T) {
@@ -1347,6 +1358,12 @@ func TestExecuteStreamReadTransportError(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error":"`) ||
 		!strings.Contains(string(downCloses[0].payload), "pipe broke") {
 		t.Fatalf("downstream must close with redacted error: %v", downCloses)
+	}
+	// The structured detail tells the host to skip credential cooldown and not
+	// replay the request: the upstream generation was already submitted.
+	if !strings.Contains(string(downCloses[0].payload), `"error_detail":`) ||
+		!strings.Contains(string(downCloses[0].payload), errclass.CodeStreamTruncated) {
+		t.Fatalf("downstream close must carry stream_truncated detail: %s", downCloses[0].payload)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostHTTPStreamClose)); got != 1 {
 		t.Fatalf("upstream close count = %d, want 1", got)
@@ -1417,6 +1434,9 @@ func TestExecuteStreamUpstreamErrorLabel(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), "upstream exploded") {
 		t.Fatalf("downstream close missing label: %v", downCloses)
 	}
+	if !strings.Contains(string(downCloses[0].payload), errclass.CodeStreamTruncated) {
+		t.Fatalf("upstream error label must carry stream_truncated detail: %s", downCloses[0].payload)
+	}
 }
 
 func TestExecuteStreamConverterError(t *testing.T) {
@@ -1440,6 +1460,10 @@ func TestExecuteStreamConverterError(t *testing.T) {
 	downCloses := f.callsOf(pluginabi.MethodHostStreamClose)
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
+	}
+	// A translation fault is request-scoped: no credential cooldown.
+	if !strings.Contains(string(downCloses[0].payload), errclass.CodeRequestScoped) {
+		t.Fatalf("converter failure must carry request_scoped detail: %s", downCloses[0].payload)
 	}
 }
 
@@ -1535,7 +1559,7 @@ func TestExecutorIdentifierAndCountTokens(t *testing.T) {
 		t.Fatalf("http_request: %v", err)
 	}
 	env = decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassUnsupported) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("http_request envelope = %s", resp)
 	}
 	if !strings.Contains(env.Error.Message, "executor.http_request") {
@@ -1589,7 +1613,7 @@ func TestExecuteMaxResponseBytesGuard(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	env := mustExecute(t, m, "opencode-go/glm-5.4", "openai", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassTranslation) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }
@@ -1611,7 +1635,7 @@ func TestExecuteTransportErrorClassified(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeTransientTransport {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }
@@ -1679,7 +1703,7 @@ func TestExecuteMalformedUpstreamStatusUsesSelectedKey(t *testing.T) {
 	// execution call is under test.
 	seen = nil
 	env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != "unsupported_protocol_or_parameter" || env.Error.HTTPStatus != http.StatusBadRequest {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeRequestScoped || env.Error.HTTPStatus != http.StatusBadRequest {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 	if len(seen) != 1 || seen[0] != pluginabi.MethodHostHTTPDo {

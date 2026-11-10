@@ -376,12 +376,14 @@ func (c Config) validate() error {
 		if !validProtocols[o.Protocol] {
 			return fmt.Errorf("route-overrides[%s].protocol: unsupported protocol %q", name, o.Protocol)
 		}
-		if o.Endpoint == "" {
-			return fmt.Errorf("route-overrides[%s].endpoint: must not be empty", name)
-		}
-		if !strings.HasPrefix(o.Endpoint, "/") {
+		// endpoint is optional: an empty value uses the protocol's configured
+		// endpoint (chat-completions-url / messages-url / responses-url).
+		// Whitespace-only values are treated as unset.
+		o.Endpoint = strings.TrimSpace(o.Endpoint)
+		if o.Endpoint != "" && !strings.HasPrefix(o.Endpoint, "/") {
 			return fmt.Errorf("route-overrides[%s].endpoint: must start with /", name)
 		}
+		c.RouteOverrides[name] = o
 	}
 	if c.ModelPrefix.Enabled && !validPrefix(c.ModelPrefix.Value) {
 		return fmt.Errorf("model-prefix.value: invalid provider-ID characters %q", c.ModelPrefix.Value)

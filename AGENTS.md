@@ -79,7 +79,32 @@ OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证
 - 上游 **401 → 401 且不可重试**（交由 CPA 切换凭证）；不要重试同一个失效 Key。
 - **首字节前**的网络错误 → 502，超时 → 504；已开始流式输出后的失败按流内错误处理，不再改写状态码。
 - 配置项 `request-timeout` 对**流式请求不是总时长**：它是首字节上限（`min(request-timeout, 60s)`）+ 空闲超时（按 chunk 重置）。长会话不应被总时长截断，改动此逻辑前先看 `stream_timeout_test.go`。
-- `executor.count_tokens` 只对 **claude 源**代理到上游 `{messages-url}/count_tokens`；其他源格式保持明确的 `unsupported`，不要静默返回 400。
+- `executor.count_tokens` 只对 **claude 源**代理到上游 `{messages-url}/count_tokens`；其他源格式返回 `not_implemented`（501），保持凭证/模型可用性中立。
+
+### 宿主可识别的错误码（v8.0.62+）
+
+CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 `errclass` 里本地定义了这些常量（保持 v8.0.50 SDK pin），`ToEnvelopeError` 负责落到 envelope：
+
+| Code | 插件使用点 | 宿主行为 |
+|---|---|---|
+| `transient_transport` | 首字节前的 EOF/reset/dial/TLS/DNS 失败（502） | 跳过凭证冷却，仍可参与请求重试 |
+| `stream_truncated` | 首字节后上游流中断（`error_detail`） | 跳过冷却，且**不换凭证重放**（生成已提交） |
+| `request_scoped` | 翻译失败、参数/协议不支持、上游 4xx | 跳过冷却并停止凭证轮换 |
+| `connection_lifecycle` | 下游客户端断开/背压导致 emit 失败 | 跳过冷却，但保留凭证轮换 |
+| `model_not_found` | 上游 404 | 只冷却该模型，不把凭证冷却 12h |
+| `not_implemented` | 非 claude 源的 `count_tokens` | 凭证/模型可用性中立 |
+| `credential_quota` | 429/402 且报文含 quota | 整个凭证额度耗尽，进入配额退避 |
+
+**背景**：未识别的 code 会退回按 HTTP 状态处理——502 冷却 1 分钟、400 冷却 1 分钟、404 冷却 12 小时（`transientErrorCooldown=1m`）。因此新增错误路径时必须显式给出上表 code，否则一次瞬时的上游 EOF 就会把健康凭证冷却掉。流式失败通过 `host.stream.close` 的 `error_detail` 字段携带结构化错误（旧宿主忽略该字段，退回纯 message）。
+
+**流式失败分类的取舍**：`stream_truncated` 同时用于上游读失败、空闲超时和响应超限——这三类都已经提交了生成，重放会重复生成/计费，因此宁可跳过冷却也不换凭证重试。代价是「持续卡顿的上游不会被自动冷却」（健康体检只探测 `/usage`，不覆盖模型级卡顿）；若未来需要冷却，必须显式改用 `force_cooldown`，不要改回状态码路径。
+
+## 协议路由约定
+
+- **三类文本后端**：`chat-completions-url`（默认 `.../inference/go/openai/v1/chat/completions`）、`messages-url`（`.../anthropic/v1/messages`）、`responses-url`（`.../openai/v1/responses`）；`google-url` 仅作 generateContent 回退，`usage-url` 与 `catalog-url` 独立。
+- **路由优先级**：`route-overrides`（模型级）> `routing.mode` > 能力校验 > 原生回退。`prefer-client-protocol` 在模型「可服务」客户端协议时直接用客户端协议并透传（`conversion=false`），否则在 `allow-translation` 下回退原生协议并由插件翻译。
+- **Console 目录的能力假设**：`SpeaksProtocol` 对 Console 文本模型放行任意文本协议（`routing.go:86-89`），即假定网关跨 API 翻译；旧目录/非文本模型只认 `api` 声明与原生协议。这是已知的宽松点：模型即使只声明 `responses`，Chat Completions 客户端仍会被发到 chat-completions 端点。遇到「协议不匹配类」上游失败（404/405/EOF）时，先用 `route-overrides` 固定到原生协议验证。
+- **`route-overrides` 语义**：`protocol` 必填（`chat-completions` / `messages` / `responses`）；`endpoint` 可选，为空时使用该协议的默认端点；配置时按 `base-url` 拼接且沿用旧规则（前导 `/v1` 被去掉）——Console base 下必须写完整路径（如 `/openai/v1/responses`，写成 `/v1/responses` 会得到 `.../inference/go/responses`）。
 
 ## 日志与诊断约定
 
@@ -95,7 +120,7 @@ OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11 已对照最新 release v8.0.61 重跑审计：ABI/Schema/方法集零变化，`server_management.go` 未变，全部 wire 差异为可选新增字段（`multi_auth_providers`、identifier `entries`、`UsageDetail` 可选细分字段、`Error.ErrorCode()`），无需同步修改即可兼容；`go.mod` 继续 pin v8.0.50。** 适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11 已对照最新 release v8.0.63 重跑审计：ABI/Schema/方法集零变化，`server_management.go` 与 pluginhost 传输层未变；v8.0.61→v8.0.63 唯一插件相关变更是 `sdk/pluginabi/types.go` 新增宿主可识别错误码与 `Error.CredentialScoped` 字段（v8.0.62 起经 `rpcError` 传递到 cooldown 流水线）。插件已按纯 code 方式适配，无需 bump SDK。** 适配新版 CPA 时按本清单重跑合规审计。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 

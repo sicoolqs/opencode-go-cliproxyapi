@@ -141,7 +141,9 @@ plugins:
       route-overrides:
         "custom-model":
           protocol: "messages"           # "chat-completions" | "messages" | "responses"
-          endpoint: "/v1/messages"       # 必须以 / 开头
+          # endpoint 可选：不配置时使用该协议的默认端点（messages-url）
+          # 配置时必须以 / 开头，并拼接到 base-url（前导 /v1 会被去掉）
+          # endpoint: "/anthropic/v1/messages"
 
       # 执行设置
       request-timeout: "5m"              # 上游请求超时（默认："5m"）
@@ -173,7 +175,7 @@ plugins:
 | `protocols.google` | `bool` | `true` | 允许 Google 原生协议的模型（当前经文本协议转译）。 |
 | `routing.mode` | `string` | `native` | 路由策略：`native`（按模型原生协议）、`prefer-client-protocol`（优先客户端协议，不可用时按 `allow-translation` 回退）、`anthropic`（统一走 Messages，要求 `protocols.messages` 开启）。 |
 | `routing.allow-translation` | `bool` | `true` | `prefer-client-protocol` 下客户端协议不可用时，是否允许回退到模型原生协议（需要本地协议转换）。 |
-| `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖目录 `api` 字段与前缀路由。合法协议：`chat-completions`、`messages`、`responses`。`endpoint` 按 `base-url` 拼接（沿用旧规则：前导 `/v1` 会被去掉），默认模式下 `base-url` 为 `https://opencode.ai/inference/go`。 |
+| `route-overrides` | `map` | `{}` | 模型 ID 到 `{ protocol: "...", endpoint: "..." }` 的映射，覆盖目录 `api` 字段与前缀路由。合法协议：`chat-completions`、`messages`、`responses`。**`endpoint` 可选**：不配置时使用该协议的默认端点（`chat-completions-url` / `messages-url` / `responses-url`）；配置时按 `base-url` 拼接（沿用旧规则：前导 `/v1` 会被去掉），默认模式下 `base-url` 为 `https://opencode.ai/inference/go`，因此需写完整路径（如 `/openai/v1/responses`）。 |
 | `request-timeout` | `duration` | `5m` | 上游 HTTP 请求超时。非流式请求为整体超时；流式请求为首字节超时上限（不超过 60s）与**空闲超时**（每收到数据即重置，长会话不会被总时长截断）。必须为正数。 |
 | `max-response-bytes` | `int64` | `67108864`（64 MiB） | 非流式响应体的最大字节数。 |
 | `allow-http` | `bool` | `false` | 为 `true` 时，各端点 URL 允许使用 `http://` 方案，便于本地测试。 |
@@ -250,7 +252,7 @@ OpenCode Go 使用静态 API Key，没有刷新令牌接口，因此插件通过
 * **定期体检**：插件内置 15 分钟周期体检（自驱动，不依赖宿主调度——CPA 的 auto-refresh 循环不会调度 API-key 类凭证）：周期性探测每个 Key，401 自动禁用、恢复后自动重新启用。宿主的 `auth.refresh` 仅在请求 401 触发或管理界面手动刷新时调用，插件会正确响应并回填凭证的 disabled 状态。
 * **外部密钥文件**：`api-keys-file` 由插件定期重读（默认 1m），新增/移除 Key 会自动应用对应凭证，无需重启 CPA。
 * **平滑轮换**：先在 `api-keys` 或密钥文件中同时保留新旧 Key 并重载/等待轮询，确认新 Key 生效后再移除旧 Key；在途流不受影响，新请求只用健康凭证。
-* **运行时行为**：上游 401 返回 401 且标记不可重试（交由 CPA 切换凭证）；首字节前网络错误返回 502、超时返回 504；流式请求使用空闲超时，长会话不会被截断。
+* **运行时行为**：上游 401 返回 401 且标记不可重试（交由 CPA 切换凭证）；首字节前网络错误返回 502、超时返回 504；流式请求使用空闲超时，长会话不会被截断。错误码对齐 CPA v8.0.62+ 的 cooldown 语义：传输层瞬时失败（`transient_transport`）不会冷却健康凭证，流式中断（`stream_truncated`）不会换凭证重放，模型级 404（`model_not_found`）只冷却模型。
 * **count_tokens**：Claude 源的 `/v1/messages/count_tokens` 会以选中凭证代理到上游 Anthropic count_tokens 端点；其他源格式仍返回明确的 unsupported。
 
 ## 测试
