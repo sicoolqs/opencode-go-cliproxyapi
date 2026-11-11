@@ -127,7 +127,7 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11 已对照最新 release v8.0.63 重跑审计：ABI/Schema/方法集零变化，`server_management.go` 与 pluginhost 传输层未变；v8.0.61→v8.0.63 唯一插件相关变更是 `sdk/pluginabi/types.go` 新增宿主可识别错误码与 `Error.CredentialScoped` 字段（v8.0.62 起经 `rpcError` 传递到 cooldown 流水线）。插件已按纯 code 方式适配，无需 bump SDK。** 适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-11 已对照最新 release v8.0.66 重跑审计：v8.0.63→v8.0.66 无插件面变更——`sdk/pluginabi/types.go` 完全一致（ABI 1 / Schema 10 / 65 个方法），`sdk/pluginapi`、`internal/pluginhost`、`server_management.go` 均未变；唯一改动的 `sdk/cliproxy/auth/conductor_cooldown.go` 只涉及 Claude cooldown signal 持久化与 quota 窗口保留，错误码识别逻辑（`transient_rate_limit` 等）未变。v8.0.66 实机冒烟通过（models/chat/messages/responses/muse 全 200）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.66**。适配新版 CPA 时按本清单重跑合规审计。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 
