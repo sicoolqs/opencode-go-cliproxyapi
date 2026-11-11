@@ -102,6 +102,7 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## 协议路由约定
 
+- **上游请求头（对齐 OpenCode 官方要求）**：Go 要求客户端用**自定义 User-Agent**（不能是 `Go-http-client/1.1`、`hertz`、`python-requests` 这类通用库/框架名）并发送稳定的 `x-opencode-session`。插件优先转发**有意义的客户端 UA**（如 `claude-cli/2.1.322`、`opencode/1.x`、`my-coding-agent/1.0`）；空值、超长（>200）、含控制字符或命中通用库/框架黑名单时回退为 `opencode-go-cliproxyapi/<version>`。session 优先取 CPA canonical / 客户端原生 session header（Claude Code、Codex 等），缺失时用对话首轮内容摘要，保证多轮稳定。不要恢复为默认 UA——文档明确把通用 UA 视为不合规客户端。
 - **三类文本后端**：`chat-completions-url`（默认 `.../inference/go/openai/v1/chat/completions`）、`messages-url`（`.../anthropic/v1/messages`）、`responses-url`（`.../openai/v1/responses`）；`google-url` 仅作 generateContent 回退，`usage-url` 与 `catalog-url` 独立。
 - **路由优先级**：`route-overrides`（模型级）> `routing.mode` > 能力校验 > 原生回退。`prefer-client-protocol` 在模型「可服务」客户端协议时直接用客户端协议并透传（`conversion=false`），否则在 `allow-translation` 下回退原生协议并由插件翻译。
 - **Console 目录的能力假设**：`SpeaksProtocol` 对 Console 文本模型放行任意文本协议（`routing.go:86-89`），即假定网关跨 API 翻译；旧目录/非文本模型只认 `api` 声明与原生协议。这是已知的宽松点：模型即使只声明 `responses`，Chat Completions 客户端仍会被发到 chat-completions 端点。遇到「协议不匹配类」上游失败（404/405/EOF）时，先用 `route-overrides` 固定到原生协议验证。

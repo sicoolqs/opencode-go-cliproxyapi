@@ -4,3 +4,5 @@ plugins/
 *.test
 *.out
 coverage.*
+# Local deployment notes (may contain credentials); never commit.
+AGENTS.local.md

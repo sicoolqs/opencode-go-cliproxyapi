@@ -252,10 +252,13 @@ func assertSessionHeaders(t *testing.T, wire map[string]any, wantSession, wantAu
 	} else if got, ok := headers["X-Api-Key"]; !ok || got.([]any)[0].(string) != testKey {
 		t.Fatalf("x-api-key missing: %v", headers)
 	}
-	for _, forbidden := range []string{"X-Opencode-Client", "X-Opencode-Request", "X-Opencode-Project", "User-Agent"} {
+	for _, forbidden := range []string{"X-Opencode-Client", "X-Opencode-Request", "X-Opencode-Project"} {
 		if _, ok := headers[forbidden]; ok {
 			t.Fatalf("forbidden header %q present: %v", forbidden, headers)
 		}
+	}
+	if got := headers["User-Agent"].([]any)[0].(string); got != pluginName+"/"+pluginVersion {
+		t.Fatalf("User-Agent = %q, want %q", got, pluginName+"/"+pluginVersion)
 	}
 }
 
@@ -1653,7 +1656,7 @@ func TestConvertNonStreamSeamBranches(t *testing.T) {
 	if got := catalog.JoinUpstreamURL("https://gw.test/", "/v1/responses"); got != "https://gw.test/responses" {
 		t.Fatalf("url join = %q", got)
 	}
-	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", "session"); got.Get("Authorization") != "Bearer k" || got.Get("x-opencode-session") != "session" {
+	if got := upstreamAuthHeaders(catalog.RouteChatCompletions, "k", "session", ""); got.Get("Authorization") != "Bearer k" || got.Get("x-opencode-session") != "session" {
 		t.Fatalf("bearer headers = %v", got)
 	}
 	// Adapters own status classification uniformly (§7).
@@ -2102,5 +2105,54 @@ func TestExecutorResponsesToolsRoundTripStream(t *testing.T) {
 	}
 	if strings.Contains(s, "subagents__spawn_agent") {
 		t.Fatalf("stream wire name leaked downstream:\n%s", s)
+	}
+}
+
+func TestUpstreamUserAgentSelection(t *testing.T) {
+	fallback := pluginName + "/" + pluginVersion
+	cases := []struct{ name, in, want string }{
+		{"empty", "", fallback},
+		{"framework", "hertz", fallback},
+		{"go library", "Go-http-client/1.1", fallback},
+		{"python library", "python-requests/2.31.0", fallback},
+		{"curl", "curl/8.4.0", fallback},
+		{"control chars", "bad\r\nua", fallback},
+		{"oversized", strings.Repeat("a", maxUserAgentLen+1), fallback},
+		{"claude code", "claude-cli/2.1.322", "claude-cli/2.1.322"},
+		{"opencode", "opencode/1.2.3", "opencode/1.2.3"},
+		{"named agent", "my-coding-agent/1.0", "my-coding-agent/1.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upstreamUserAgent(tc.in); got != tc.want {
+				t.Fatalf("upstreamUserAgent(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExecuteForwardsClientUserAgent(t *testing.T) {
+	for _, tc := range []struct{ name, ua, want string }{
+		{"real client", "claude-cli/2.1.322", "claude-cli/2.1.322"},
+		{"generic framework", "hertz", pluginName + "/" + pluginVersion},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, f := newExecManager(t)
+			body, _ := json.Marshal(executorRequest{ExecutorRequest: pluginapi.ExecutorRequest{
+				AuthProvider: ProviderID, AuthAttributes: map[string]string{"api_key": testKey},
+				Model: "opencode-go/glm-5.3", SourceFormat: "openai",
+				OriginalRequest: []byte(ccRequestBody),
+				Headers:         http.Header{"User-Agent": []string{tc.ua}},
+			}})
+			resp, err := m.HandleCall("executor.execute", body)
+			if err != nil || !decodeEnv(t, resp).OK {
+				t.Fatalf("execute: %v %s", err, resp)
+			}
+			wire := lastWire(t, f, pluginabi.MethodHostHTTPDo)
+			headers := wire["headers"].(map[string]any)
+			if got := headers["User-Agent"].([]any)[0].(string); got != tc.want {
+				t.Fatalf("User-Agent = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

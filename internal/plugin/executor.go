@@ -167,7 +167,7 @@ func (m *Manager) handleCountTokens(request []byte) ([]byte, error) {
 	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(catalog.RouteMessages, res.key, sessionID),
+		Headers: upstreamAuthHeaders(catalog.RouteMessages, res.key, sessionID, req.Headers.Get("User-Agent")),
 		Body:    body,
 	})
 	if err != nil {
@@ -222,7 +222,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	resp, err := m.bridge.Do(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID, req.Headers.Get("User-Agent")),
 		Body:    upstreamBody,
 	})
 	if err != nil {
@@ -256,7 +256,7 @@ func buildUpstreamRequest(route catalog.Route, upstreamModel, sourceFormat strin
 	return nil, errclass.Translation("unsupported route")
 }
 
-func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header {
+func upstreamAuthHeaders(route catalog.Route, key, sessionID, clientUA string) http.Header {
 	var h http.Header
 	if route == catalog.RouteMessages {
 		h = messages.AuthHeaders(key)
@@ -264,8 +264,58 @@ func upstreamAuthHeaders(route catalog.Route, key, sessionID string) http.Header
 		// Chat Completions and Responses endpoints are OpenAI-style bearer.
 		h = chatcompletions.AuthHeaders(key)
 	}
+	// OpenCode Go requires clients to identify themselves with a distinct user
+	// agent rather than a generic HTTP-library name, and to send a stable
+	// session ID. A real client UA is forwarded when it is meaningful;
+	// generic library/framework UAs fall back to the plugin's own identity.
+	h.Set("User-Agent", upstreamUserAgent(clientUA))
 	h.Set("x-opencode-session", sessionID)
 	return h
+}
+
+// maxUserAgentLen bounds a forwarded client UA so a hostile client cannot
+// inflate the upstream header without limit.
+const maxUserAgentLen = 200
+
+// genericUserAgentPrefixes lists SDK/HTTP-library/framework UA prefixes that
+// OpenCode Go explicitly does not want to see ("rather than a generic SDK or
+// HTTP-library name"). They are matched case-insensitively as prefixes.
+var genericUserAgentPrefixes = []string{
+	"go-http-client", "python-requests", "python-urllib", "httpx", "aiohttp",
+	"curl/", "wget/", "libwww", "okhttp", "java/", "node-fetch", "undici",
+	"axios", "node/", "deno/", "bun/", "dart:io", "hertz", "fasthttp",
+	"go-resty", "resty", "postmanruntime", "insomnia", "httpie", "reqwest",
+	"hyper", "guzzle", "restsharp", "unity",
+}
+
+// upstreamUserAgent forwards a meaningful client UA (Claude Code, Codex,
+// OpenCode, a named agent) and falls back to the plugin identity for empty,
+// oversized, control-character or generic library/framework UAs.
+func upstreamUserAgent(clientUA string) string {
+	ua := strings.TrimSpace(clientUA)
+	if ua == "" || len(ua) > maxUserAgentLen || hasHeaderControlChars(ua) || isGenericUserAgent(ua) {
+		return pluginName + "/" + pluginVersion
+	}
+	return ua
+}
+
+func isGenericUserAgent(ua string) bool {
+	lower := strings.ToLower(ua)
+	for _, prefix := range genericUserAgentPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasHeaderControlChars(value string) bool {
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 const emptyOpenCodeSessionID = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -555,7 +605,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	st, stHeaders, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
-		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID),
+		Headers: upstreamAuthHeaders(decision.UpstreamProtocol, res.key, sessionID, req.Headers.Get("User-Agent")),
 		Body:    upstreamBody,
 	})
 	debugTrace("executor stream DoStream status=%d upstreamID=%s err=%v", st, id, err)
