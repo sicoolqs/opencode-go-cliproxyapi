@@ -94,6 +94,7 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 | `model_not_found` | 上游 404 | 只冷却该模型，不把凭证冷却 12h |
 | `not_implemented` | 非 claude 源的 `count_tokens` | 凭证/模型可用性中立 |
 | `credential_quota` | 429/402 且报文含 quota | 整个凭证额度耗尽，进入配额退避 |
+| `transient_rate_limit` | 429 且报文为容量过载（overloaded / at capacity / service busy） | 只冷却该模型至 Retry-After，不标记额度耗尽 |
 
 **背景**：未识别的 code 会退回按 HTTP 状态处理——502 冷却 1 分钟、400 冷却 1 分钟、404 冷却 12 小时（`transientErrorCooldown=1m`）。因此新增错误路径时必须显式给出上表 code，否则一次瞬时的上游 EOF 就会把健康凭证冷却掉。流式失败通过 `host.stream.close` 的 `error_detail` 字段携带结构化错误（旧宿主忽略该字段，退回纯 message）。
 

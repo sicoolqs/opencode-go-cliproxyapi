@@ -1684,6 +1684,34 @@ func TestConvertNonStreamSeamBranches(t *testing.T) {
 	}
 }
 
+func TestExecuteOverload429IsTransientRateLimit(t *testing.T) {
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(testCatalogJSON, func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		return hostOK(pluginapi.HTTPResponse{
+			StatusCode: http.StatusTooManyRequests,
+			Headers:    http.Header{"Retry-After": []string{"2"}},
+			Body:       []byte(`{"error":{"message":"The inference service is overloaded. Please try again later."}}`),
+		}), nil
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody))
+	// Capacity 429s are per-model transient limits, not credential quota
+	// exhaustion; Retry-After must reach the host for a short cooldown.
+	if env.OK || env.Error == nil ||
+		env.Error.Code != errclass.CodeTransientRateLimit ||
+		env.Error.HTTPStatus != http.StatusTooManyRequests ||
+		env.Error.RetryAfterSeconds != 2 {
+		t.Fatalf("envelope = %+v", env.Error)
+	}
+}
+
 func TestExecuteMalformedUpstreamStatusUsesSelectedKey(t *testing.T) {
 	f := &fakeCaller{}
 	m := NewManager(NewHostBridge(f.call))

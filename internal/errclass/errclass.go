@@ -52,6 +52,9 @@ const (
 //     availability-neutral for the credential and model.
 //   - CodeCredentialQuota: a 429/402 that exhausts the entire credential
 //     across all models.
+//   - CodeTransientRateLimit: a 429 that reports server-side capacity
+//     ("service overloaded"), not credential quota. CPA cools only the
+//     reporting model until Retry-After instead of exhausting the credential.
 const (
 	CodeTransientTransport  = "transient_transport"
 	CodeStreamTruncated     = "stream_truncated"
@@ -60,6 +63,7 @@ const (
 	CodeModelNotFound       = "model_not_found"
 	CodeNotImplemented      = "not_implemented"
 	CodeCredentialQuota     = "credential_quota"
+	CodeTransientRateLimit  = "transient_rate_limit"
 )
 
 // Error describes classified request errors and retryability for CPA execution.
@@ -91,6 +95,10 @@ func FromStatus(status int, message string, headers ...http.Header) *Error {
 	msg := Redact(message)
 	lowerMsg := strings.ToLower(msg)
 	quota := strings.Contains(lowerMsg, "quota")
+	// A 429 that reports server-side capacity is a transient per-model limit,
+	// not credential quota exhaustion. Treating it as quota would cool the
+	// whole key (all models) and escalate the backoff on every overload blip.
+	overloaded := !quota && isTransientOverload(lowerMsg)
 	retryAfter := 0
 	for _, h := range headers {
 		if v := RetryAfterFromHeaders(h); v > 0 {
@@ -119,10 +127,13 @@ func FromStatus(status int, message string, headers ...http.Header) *Error {
 		return &Error{Class: ClassInvalidModel, Code: CodeModelNotFound, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
 	case 429:
 		e := &Error{Class: quotaClass(ClassRateLimit), Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
-		if quota {
+		switch {
+		case quota:
 			// Explicit whole-credential quota refusal; the code keeps the scope
 			// across RPC envelopes and stream error details.
 			e.Code = CodeCredentialQuota
+		case overloaded:
+			e.Code = CodeTransientRateLimit
 		}
 		return e
 	}
@@ -130,6 +141,26 @@ func FromStatus(status int, message string, headers ...http.Header) *Error {
 		return &Error{Class: ClassUpstream, Message: msg, StatusCode: status, Retryable: true, RetryAfterSeconds: retryAfter}
 	}
 	return &Error{Class: ClassUnsupported, Message: msg, StatusCode: status, RetryAfterSeconds: retryAfter}
+}
+
+// isTransientOverload reports whether a 429 message describes server-side
+// capacity pressure rather than a credential quota refusal. Kept narrow on
+// purpose: only explicit overload/capacity wording qualifies, so generic rate
+// limits stay on the credential quota path.
+func isTransientOverload(lowerMsg string) bool {
+	for _, marker := range []string{
+		"overloaded",
+		"over capacity",
+		"at capacity",
+		"capacity exceeded",
+		"service is busy",
+		"service busy",
+	} {
+		if strings.Contains(lowerMsg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // RetryAfterFromHeaders extracts upstream retry guidance in seconds from

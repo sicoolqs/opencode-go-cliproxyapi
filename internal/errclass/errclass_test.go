@@ -116,6 +116,28 @@ func TestHostRecognizedCodes(t *testing.T) {
 	}
 }
 
+func TestTransientOverload429(t *testing.T) {
+	// Upstream capacity 429s must not exhaust the credential across all models.
+	e := FromStatus(429, "The inference service is overloaded. Please try again later.")
+	if e.Code != CodeTransientRateLimit || e.StatusCode != 429 || !e.Retryable || e.Class != ClassRateLimit {
+		t.Fatalf("overload 429 = %+v, want %q", e, CodeTransientRateLimit)
+	}
+	// Quota wording always wins: it is credential-scoped.
+	e = FromStatus(429, "quota exceeded while the service is overloaded")
+	if e.Code != CodeCredentialQuota {
+		t.Errorf("quota+overload code = %q, want %q", e.Code, CodeCredentialQuota)
+	}
+	// Generic 429 keeps the status-based quota path (no explicit code).
+	if e = FromStatus(429, "too many requests"); e.Code != "" {
+		t.Errorf("generic 429 code = %q, want empty", e.Code)
+	}
+	// Retry-After is preserved for both quota and overload responses.
+	h := http.Header{"Retry-After": []string{"7"}}
+	if e = FromStatus(429, "service is busy", h); e.Code != CodeTransientRateLimit || e.RetryAfterSeconds != 7 {
+		t.Errorf("overload with retry-after = %+v", e)
+	}
+}
+
 func TestToEnvelopeErrorCodes(t *testing.T) {
 	// Request-level classes without an explicit code become request_scoped so a
 	// malformed client request cannot cool a credential.
