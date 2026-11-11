@@ -100,6 +100,28 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 **流式失败分类的取舍**：`stream_truncated` 同时用于上游读失败、空闲超时和响应超限——这三类都已经提交了生成，重放会重复生成/计费，因此宁可跳过冷却也不换凭证重试。代价是「持续卡顿的上游不会被自动冷却」（健康体检只探测 `/usage`，不覆盖模型级卡顿）；若未来需要冷却，必须显式改用 `force_cooldown`，不要改回状态码路径。
 
+## 冷却策略
+
+插件**不维护冷却状态**；冷却完全由 CPA 宿主按错误码/状态决定（v8.0.66）：
+
+| 上游 | 插件 code | 宿主冷却（模型级） |
+|---|---|---|
+| 401 | `auth_failure` | 30m + 凭证拒绝（插件体检另会禁用该 Key） |
+| 402 | `billing` / `quota_exhaustion` | 30m（忽略 Retry-After） |
+| 403 | `auth_failure` / `quota_exhaustion` | 30m |
+| 404 | `model_not_found` | 12h（仅该模型） |
+| 429 overload | `transient_rate_limit` | 至 Retry-After（短） |
+| 429 quota | `credential_quota` | 凭证级配额退避 |
+| 5xx | `upstream_server_failure` | 1m |
+| 首字节前网络错误 | `transient_transport` | 无 |
+| 流中断 | `stream_truncated` | 无 |
+| 请求级/翻译 | `request_scoped` | 无 |
+
+- 请求结果带 model key 时为模型级；无 model key 时才落到凭证级。
+- 插件无法设置宿主的 `disable-cooling`（那是 CPA provider/全局配置）；只能通过错误码影响冷却。
+- **个人部署建议**：在 CPA 配置中设置 `routing.cooldown.disable-cooling: true`，关闭全部 auth/model 冷却，优先保证连通性；`request-retry` 保持 0，避免流式重放。代价是 402/429/5xx 每次都真实等待上游。
+- 关闭冷却不会关闭插件的 401 凭证禁用与最后凭证保护；也不会关闭 panic 熔断（后者仅由 panic 触发，已全部 recover）。
+
 ## 协议路由约定
 
 - **上游请求头（对齐 OpenCode 官方要求）**：Go 要求客户端用**自定义 User-Agent**（不能是 `Go-http-client/1.1`、`hertz`、`python-requests` 这类通用库/框架名）并发送稳定的 `x-opencode-session`。插件优先转发**有意义的客户端 UA**（如 `claude-cli/2.1.322`、`opencode/1.x`、`my-coding-agent/1.0`）；空值、超长（>200）、含控制字符或命中通用库/框架黑名单时回退为 `opencode-go-cliproxyapi/<version>`。session 优先取 CPA canonical / 客户端原生 session header（Claude Code、Codex 等），缺失时用对话首轮内容摘要，保证多轮稳定。不要恢复为默认 UA——文档明确把通用 UA 视为不合规客户端。
