@@ -102,7 +102,7 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## 冷却策略
 
-插件**不维护冷却状态**；冷却完全由 CPA 宿主按错误码/状态决定（v8.0.66）：
+插件**不维护冷却状态**；冷却完全由 CPA 宿主按错误码/状态决定（v8.0.74）：
 
 | 上游 | 插件 code | 宿主冷却（模型级） |
 |---|---|---|
@@ -150,7 +150,13 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（审计基线：SDK `github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-11 已对照最新 release v8.0.66 重跑审计：v8.0.63→v8.0.66 无插件面变更——`sdk/pluginabi/types.go` 完全一致（ABI 1 / Schema 10 / 65 个方法），`sdk/pluginapi`、`internal/pluginhost`、`server_management.go` 均未变；唯一改动的 `sdk/cliproxy/auth/conductor_cooldown.go` 只涉及 Claude cooldown signal 持久化与 quota 窗口保留，错误码识别逻辑（`transient_rate_limit` 等）未变。v8.0.66 实机冒烟通过（models/chat/messages/responses/muse 全 200）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.66**。适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（SDK pin：`github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-16 已对照最新 release v8.0.74 重跑审计：ABI 契约未变（ABI 1 / Schema 10 / 方法集合与错误码常量无增删）；v8.0.66→v8.0.74 触及插件面的提交仅三个，均无需适配——① v8.0.70 `5b63e29a` 将 OAuth 作用域插件执行器的模型改为凭证绑定、StaticModels 仅进目录（本插件已显式声明 `executor_model_scope: oauth` 且经 `model.for_auth` 按凭证返回模型，语义一致）；② v8.0.71 `22d40703` 新增 `SchedulerPickResponse.ExcludeCandidates`（本插件未实现 `scheduler.pick`）；③ v8.0.74 `508f8708` 全仓改用 moego JSON/regexp（`pluginabi/types.go` 与 `rpc_schema.go` 仅 import 变化，wire 格式不变）。`internal/api/server_management.go` 与 `sdk/cliproxy/auth/auto_refresh_loop.go` 自 v8.0.66 起零提交（插件路由挂载、API-key 不参与 auto-refresh 的前提不变）；`conductor_cooldown.go` 的变化仅涉及 `force_cooldown` 持久化与池级 429 重置时间，错误码识别逻辑未变。v8.0.74 实机升级与冒烟通过（健康检查 200 且含 `opencode-go/*`）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.74**。适配新版 CPA 时按本清单重跑合规审计。
+
+### SDK pin 保持 v8.0.50 的理由与升级陷阱
+
+**保持 v8.0.50 是刻意选择，不是遗漏**：SDK pin 只决定编译期类型，运行时兼容性由宿主版本与 wire JSON 契约决定。宿主新增字段对旧 SDK 编译的插件透明（`encoding/json` 忽略未知字段），而 v8.0.74 新增的能力（`SchedulerPickResponse.ExcludeCandidates`、多 auth 入口、usage modality、raw body patch、`host.auth.models`）本插件均未使用，没有必须升级的类型。采用新能力前先评估收益，不要仅为「版本对齐」而升级。
+
+**升级 pin 时必须处理 moego**：v8.0.74 起 `sdk/pluginabi`（`Envelope` / `NewErrorEnvelope`）改用 `github.com/MoeForge/moego/json`。CPA 主模块通过 `replace github.com/MoeForge/moego v0.1.0-alpha.3 => github.com/router-for-me/moego v0.1.3` 指向实际实现，但**依赖模块的 `replace` 对下游不生效**：只 bump pin 会让本插件落到 `MoeForge/moego v0.1.0-alpha.3`，与宿主实际运行版本不一致。升级 pin 时必须在 `go.mod` 同步该 `replace`，然后重跑 `go test -tags debug ./...`、`go test -race ./internal/plugin/` 与 CGO 交叉编译（共享库会新增 moego 依赖，需复核体积与导出符号）。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 
