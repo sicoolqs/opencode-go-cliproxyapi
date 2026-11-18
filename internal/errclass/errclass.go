@@ -31,10 +31,10 @@ const (
 	ClassTranslation  Class = "translation_failure"
 )
 
-// Host-recognized pluginabi error codes (CLIProxyAPI v8.0.62+). They are
-// defined locally so the plugin keeps its v8.0.50 SDK pin: older hosts ignore
-// unknown codes and fall back to HTTP-status behavior, newer hosts use them to
-// decide credential/model cooldown and request retries.
+// Host-recognized pluginabi error codes. Aliased to the SDK constants so the
+// plugin cannot drift from the host's recognized set; older hosts that do not
+// know a code fall back to HTTP-status behavior, newer hosts use them to decide
+// credential/model cooldown and request retries.
 //
 //   - CodeTransientTransport: pre-HTTP dial/TLS/DNS/reset/EOF failure. Skips
 //     credential cooldown and stays eligible for request retries; without it a
@@ -56,14 +56,14 @@ const (
 //     ("service overloaded"), not credential quota. CPA cools only the
 //     reporting model until Retry-After instead of exhausting the credential.
 const (
-	CodeTransientTransport  = "transient_transport"
-	CodeStreamTruncated     = "stream_truncated"
-	CodeRequestScoped       = "request_scoped"
-	CodeConnectionLifecycle = "connection_lifecycle"
-	CodeModelNotFound       = "model_not_found"
-	CodeNotImplemented      = "not_implemented"
-	CodeCredentialQuota     = "credential_quota"
-	CodeTransientRateLimit  = "transient_rate_limit"
+	CodeTransientTransport  = pluginabi.ErrorCodeTransientTransport
+	CodeStreamTruncated     = pluginabi.ErrorCodeStreamTruncated
+	CodeRequestScoped       = pluginabi.ErrorCodeRequestScoped
+	CodeConnectionLifecycle = pluginabi.ErrorCodeConnectionLifecycle
+	CodeModelNotFound       = pluginabi.ErrorCodeModelNotFound
+	CodeNotImplemented      = pluginabi.ErrorCodeNotImplemented
+	CodeCredentialQuota     = pluginabi.ErrorCodeCredentialQuota
+	CodeTransientRateLimit  = pluginabi.ErrorCodeTransientRateLimit
 )
 
 // Error describes classified request errors and retryability for CPA execution.
@@ -296,6 +296,10 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 		Retryable:         e.Retryable,
 		HTTPStatus:        status,
 		RetryAfterSeconds: e.RetryAfterSeconds,
+		// Make the credential-wide quota scope explicit. The host also
+		// recognizes the code itself, but the field keeps the intent visible
+		// if code recognition ever changes.
+		CredentialScoped: code == CodeCredentialQuota,
 	}
 }
 

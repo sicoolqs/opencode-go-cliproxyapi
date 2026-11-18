@@ -118,6 +118,7 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 | 请求级/翻译 | `request_scoped` | 无 |
 
 - 请求结果带 model key 时为模型级；无 model key 时才落到凭证级。
+- 错误码常量已改为 **SDK 的 `pluginabi.ErrorCode*` 别名**，避免与宿主识别集合漂移；`credential_quota` 同时显式设置 `Error.CredentialScoped=true`（宿主也可仅凭 code 识别，字段用于语义清晰与未来兼容）。
 - 插件无法设置宿主的 `disable-cooling`（那是 CPA provider/全局配置）；只能通过错误码影响冷却。
 - **个人部署建议**：在 CPA 配置中设置 `routing.cooldown.disable-cooling: true`，关闭全部 auth/model 冷却，优先保证连通性；`request-retry` 保持 0，避免流式重放。代价是 402/429/5xx 每次都真实等待上游。
 - 关闭冷却不会关闭插件的 401 凭证禁用与最后凭证保护；也不会关闭 panic 熔断（后者仅由 panic 触发，已全部 recover）。
@@ -150,13 +151,15 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（SDK pin：`github.com/router-for-me/CLIProxyAPI/v8 v8.0.50`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-16 已对照最新 release v8.0.74 重跑审计：ABI 契约未变（ABI 1 / Schema 10 / 方法集合与错误码常量无增删）；v8.0.66→v8.0.74 触及插件面的提交仅三个，均无需适配——① v8.0.70 `5b63e29a` 将 OAuth 作用域插件执行器的模型改为凭证绑定、StaticModels 仅进目录（本插件已显式声明 `executor_model_scope: oauth` 且经 `model.for_auth` 按凭证返回模型，语义一致）；② v8.0.71 `22d40703` 新增 `SchedulerPickResponse.ExcludeCandidates`（本插件未实现 `scheduler.pick`）；③ v8.0.74 `508f8708` 全仓改用 moego JSON/regexp（`pluginabi/types.go` 与 `rpc_schema.go` 仅 import 变化，wire 格式不变）。`internal/api/server_management.go` 与 `sdk/cliproxy/auth/auto_refresh_loop.go` 自 v8.0.66 起零提交（插件路由挂载、API-key 不参与 auto-refresh 的前提不变）；`conductor_cooldown.go` 的变化仅涉及 `force_cooldown` 持久化与池级 429 重置时间，错误码识别逻辑未变。v8.0.74 实机升级与冒烟通过（健康检查 200 且含 `opencode-go/*`）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.74**。适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（SDK pin：`github.com/router-for-me/CLIProxyAPI/v8 v8.0.77`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-18 已完成 SDK pin 从 v8.0.50 到 v8.0.77 的升级并重跑审计：ABI 契约未变（ABI 1 / Schema 10；方法集新增可选的 `scheduler.continuity`，本插件未实现 scheduler，不受影响）；v8.0.74→v8.0.77 的插件面变更全部为加法（`SchedulerContinuity`、`UsageAttribution`、`UsageDetail` 缓存 TTL 字段、`rpc_schema` 可选字段），现有代码零改动；`internal/api/server_management.go` 未变；`auto_refresh_loop.go` 仅修正重新调度边界（API-key 仍不参与 auto-refresh，插件 15 分钟自检仍需保留）；`conductor_cooldown.go` 仅涉及 `force_cooldown` 持久化与池级 429 重置，错误码识别与 `disable-cooling` 逻辑未变。升级后 `go build`/`go vet`/全量测试/`-race`/CGO 交叉编译均通过，v8.0.77 实机冒烟通过（models/chat/messages/responses 200）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.77**。适配新版 CPA 时按本清单重跑合规审计。
 
-### SDK pin 保持 v8.0.50 的理由与升级陷阱
+### SDK pin 升级记录与注意事项（v8.0.50 → v8.0.77）
 
-**保持 v8.0.50 是刻意选择，不是遗漏**：SDK pin 只决定编译期类型，运行时兼容性由宿主版本与 wire JSON 契约决定。宿主新增字段对旧 SDK 编译的插件透明（`encoding/json` 忽略未知字段），而 v8.0.74 新增的能力（`SchedulerPickResponse.ExcludeCandidates`、多 auth 入口、usage modality、raw body patch、`host.auth.models`）本插件均未使用，没有必须升级的类型。采用新能力前先评估收益，不要仅为「版本对齐」而升级。
+**升级结论：代码零改动，主要成本是依赖与共享库体积。** v8.0.50→v8.0.77 的插件面类型均为加法；本插件只 import `sdk/pluginabi` 与 `sdk/pluginapi`，编译/测试无需修改。实测共享库 `.so` 从 6,829,472 增至 7,281,152（+451,680，约 +6.6%），导出符号与 glibc 依赖不变。
 
-**升级 pin 时必须处理 moego**：v8.0.74 起 `sdk/pluginabi`（`Envelope` / `NewErrorEnvelope`）改用 `github.com/MoeForge/moego/json`。CPA 主模块通过 `replace github.com/MoeForge/moego v0.1.0-alpha.3 => github.com/router-for-me/moego v0.1.3` 指向实际实现，但**依赖模块的 `replace` 对下游不生效**：只 bump pin 会让本插件落到 `MoeForge/moego v0.1.0-alpha.3`，与宿主实际运行版本不一致。升级 pin 时必须在 `go.mod` 同步该 `replace`，然后重跑 `go test -tags debug ./...`、`go test -race ./internal/plugin/` 与 CGO 交叉编译（共享库会新增 moego 依赖，需复核体积与导出符号）。
+**moego 依赖已处理**：v8.0.77 直接依赖 `github.com/MoeForge/moego v0.1.0-alpha.4`，`go mod tidy` 会把它加入 `go.mod`（indirect）；**不需要 `replace`**。此前 v8.0.74 的 `alpha.3 => router-for-me/moego v0.1.3` replace 说明已过时，勿再照搬。`pluginabi.Envelope.Result` 仍是 `encoding/json.RawMessage` 的别名，现有 `encoding/json` envelope 序列化保持有效。
+
+**未来升级的检查点**：① 若 `Envelope.Result` 不再是 stdlib 别名，需改用 `moego/json` 序列化 envelope；② 采用 `UsageAttribution` / `SchedulerContinuity` / 新 `UsageDetail` 字段前先评估收益；③ 升级后至少跑 `go test -tags debug ./...`、`go test -race ./internal/plugin/`、CGO 交叉编译并复核体积/导出符号；④ 在目标宿主版本上做一次 E2E 冒烟。
 
 ### 关于 `/v0/management` 的「废弃」注记（不要误读）
 
