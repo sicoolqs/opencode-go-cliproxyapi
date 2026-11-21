@@ -83,7 +83,7 @@ OpenCode Go 的 Key 是**静态 Key，没有刷新/续期接口**。因此凭证
 
 ### 宿主可识别的错误码（v8.0.62+）
 
-CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 `errclass` 里本地定义了这些常量（保持 v8.0.50 SDK pin），`ToEnvelopeError` 负责落到 envelope：
+CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 `errclass` 里引用 `pluginabi.ErrorCode*` 别名定义这些常量，`ToEnvelopeError` 负责落到 envelope：
 
 | Code | 插件使用点 | 宿主行为 |
 |---|---|---|
@@ -151,13 +151,15 @@ CPA 的 cooldown/重试流水线只认特定 `pluginabi.Error.Code`。插件在 
 
 ## CPA 版本适配与升级检查清单
 
-本插件基于 CLIProxyAPI v8 插件体系（SDK pin：`github.com/router-for-me/CLIProxyAPI/v8 v8.0.77`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@2422c6b`/v8.0.32）。**2026-11-18 已完成 SDK pin 从 v8.0.50 到 v8.0.77 的升级并重跑审计：ABI 契约未变（ABI 1 / Schema 10；方法集新增可选的 `scheduler.continuity`，本插件未实现 scheduler，不受影响）；v8.0.74→v8.0.77 的插件面变更全部为加法（`SchedulerContinuity`、`UsageAttribution`、`UsageDetail` 缓存 TTL 字段、`rpc_schema` 可选字段），现有代码零改动；`internal/api/server_management.go` 未变；`auto_refresh_loop.go` 仅修正重新调度边界（API-key 仍不参与 auto-refresh，插件 15 分钟自检仍需保留）；`conductor_cooldown.go` 仅涉及 `force_cooldown` 持久化与池级 429 重置，错误码识别与 `disable-cooling` 逻辑未变。升级后 `go build`/`go vet`/全量测试/`-race`/CGO 交叉编译均通过，v8.0.77 实机冒烟通过（models/chat/messages/responses 200）。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.77**。适配新版 CPA 时按本清单重跑合规审计。
+本插件基于 CLIProxyAPI v8 插件体系（SDK pin：`github.com/router-for-me/CLIProxyAPI/v8 v8.0.80`，`ABIVersion=1`、`SchemaVersion=10`；上一基线为 `main@85196e1`/v8.0.77）。**2026-11-21 已完成 SDK pin 从 v8.0.77 到 v8.0.80 的升级并重跑审计：ABI 契约未变（ABI 1 / Schema 10）；`sdk/pluginabi/types.go`、`internal/pluginhost/rpc_schema.go`、`loader_unix.go` / `loader_windows.go` / `abi.go` 在 v8.0.77→v8.0.80 间字节级一致，C ABI 结构体与 `cliproxy_plugin_init` 符号名未变；`go.mod` 上游依赖完全一致（moego 仍 `v0.1.0-alpha.4`）。v8.0.77→v8.0.80 的插件面变更全部为加法且均落在 `ResponseInterceptRequest`（新增 `Kind` / `ResponseInterceptKind*` 常量 / `TerminateScope` / `Metadata` 字段，以及 v8.0.80 的 credential-scoped after-auth request termination 语义），本插件不实现 `response.intercept_after` / `ResponseInterceptor`，不受影响。`adapters_interceptors.go`（宿主侧填充新字段）仅 +77 字节，属宿主内部。升级后 `go build`/`go vet`/全量测试（`-tags debug`）/`-race`/CGO 交叉编译均通过；`.so` 体积与 v8.0.77 基线完全一致（7,281,120 字节），导出符号与 glibc 依赖不变。** 此前的关键适配仍有效：v8.0.62 起宿主才通过 `rpcError.ErrorCode()` 传播插件错误码（v8.0.56 会退化为状态码冷却），**生产宿主必须 ≥ v8.0.62，建议 v8.0.80**。适配新版 CPA 时按本清单重跑合规审计。
 
-### SDK pin 升级记录与注意事项（v8.0.50 → v8.0.77）
+### SDK pin 升级记录与注意事项（v8.0.50 → v8.0.77 → v8.0.80）
 
-**升级结论：代码零改动，主要成本是依赖与共享库体积。** v8.0.50→v8.0.77 的插件面类型均为加法；本插件只 import `sdk/pluginabi` 与 `sdk/pluginapi`，编译/测试无需修改。实测共享库 `.so` 从 6,829,472 增至 7,281,152（+451,680，约 +6.6%），导出符号与 glibc 依赖不变。
+**v8.0.77 → v8.0.80 升级结论：代码零改动，依赖与共享库体积均不变。** v8.0.77→v8.0.80 的插件面变更全部为加法且集中在 `ResponseInterceptRequest`（`Kind`/`TerminateScope`/`Metadata`/after-auth termination），本插件不实现响应拦截器，透明无感。`sdk/pluginabi/types.go`（SHA 一致）、`rpc_schema.go`、`loader_*.go`、`abi.go` 字节级不变；`go.mod` 上游依赖（moego `v0.1.0-alpha.4`）完全一致，`go mod tidy` 无新增。实测 `.so` 体积 7,281,120 字节，与 v8.0.77 基线完全相同；ELF64/ET_DYN/x86-64、`libc.so.6` glibc 依赖、4 个导出符号全部不变。
 
-**moego 依赖已处理**：v8.0.77 直接依赖 `github.com/MoeForge/moego v0.1.0-alpha.4`，`go mod tidy` 会把它加入 `go.mod`（indirect）；**不需要 `replace`**。此前 v8.0.74 的 `alpha.3 => router-for-me/moego v0.1.3` replace 说明已过时，勿再照搬。`pluginabi.Envelope.Result` 仍是 `encoding/json.RawMessage` 的别名，现有 `encoding/json` envelope 序列化保持有效。
+**v8.0.50 → v8.0.77 历史结论（仍有效）：代码零改动，主要成本是依赖与共享库体积。** v8.0.50→v8.0.77 的插件面类型均为加法；本插件只 import `sdk/pluginabi` 与 `sdk/pluginapi`，编译/测试无需修改。实测共享库 `.so` 从 6,829,472 增至 7,281,152（+451,680，约 +6.6%），导出符号与 glibc 依赖不变。
+
+**moego 依赖已处理**：v8.0.77/v8.0.80 直接依赖 `github.com/MoeForge/moego v0.1.0-alpha.4`，`go mod tidy` 会把它加入 `go.mod`（indirect）；**不需要 `replace`**。此前 v8.0.74 的 `alpha.3 => router-for-me/moego v0.1.3` replace 说明已过时，勿再照搬。`pluginabi.Envelope.Result` 仍是 `moego/json.RawMessage` 的别名（与 stdlib `encoding/json.RawMessage` 二进制兼容），现有 `encoding/json` envelope 序列化保持有效。
 
 **未来升级的检查点**：① 若 `Envelope.Result` 不再是 stdlib 别名，需改用 `moego/json` 序列化 envelope；② 采用 `UsageAttribution` / `SchedulerContinuity` / 新 `UsageDetail` 字段前先评估收益；③ 升级后至少跑 `go test -tags debug ./...`、`go test -race ./internal/plugin/`、CGO 交叉编译并复核体积/导出符号；④ 在目标宿主版本上做一次 E2E 冒烟。
 

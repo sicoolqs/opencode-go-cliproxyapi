@@ -10,7 +10,7 @@
 - 错误分类对齐：上游 401 改为不可重试；首字节前网络错误返回 502、超时返回 504，便于客户端与 CPA 正确收敛。
 - 适配 CPA v8.0.62+ 宿主可识别错误码：首字节前的 EOF/reset 等传输失败返回 `transient_transport`（不再让健康凭证被冷却 1 分钟）、流式中断返回 `stream_truncated`（跳过冷却且不换凭证重放）、下游断开返回 `connection_lifecycle`、翻译失败返回 `request_scoped`、上游 404 返回 `model_not_found`（只冷却模型而非凭证 12 小时）、非 claude 源 `count_tokens` 返回 `not_implemented`/501。流式失败通过 `host.stream.close` 的 `error_detail` 携带结构化错误，旧宿主自动退回纯 message。
 - 错误码常量改为 SDK `pluginabi.ErrorCode*` 别名，避免与宿主识别集合漂移；`credential_quota` 显式设置 `Error.CredentialScoped=true`。
-- 升级 CLIProxyAPI SDK pin：`v8.0.50` → `v8.0.77`。插件面变更均为加法（`scheduler.continuity`、`UsageAttribution`、`UsageDetail` 缓存 TTL 字段），现有代码零改动；`go mod tidy` 新增 `MoeForge/moego v0.1.0-alpha.4`（无需 replace）。已验证 build/vet/全量测试/`-race`/CGO 交叉编译与 v8.0.77 实机冒烟；共享库体积约 +6.6%。
+- 升级 CLIProxyAPI SDK pin：`v8.0.50` → `v8.0.77` → `v8.0.80`。v8.0.77→v8.0.80 插件面变更全部为加法且集中在 `ResponseInterceptRequest`（`Kind`/`TerminateScope`/`Metadata`/after-auth termination），本插件不实现响应拦截器，透明无感；`sdk/pluginabi/types.go`、`rpc_schema.go`、`loader_*.go`、`abi.go` 字节级一致，`go.mod` 上游依赖不变（moego 仍 `v0.1.0-alpha.4`）。已验证 build/vet/全量测试/`-race`/CGO 交叉编译；`.so` 体积与 v8.0.77 基线完全一致（7,281,120 字节），导出符号与 glibc 依赖不变。
 - 上游 User-Agent 对齐 OpenCode 官方要求：优先转发有意义的客户端 UA（Claude Code/Codex/OpenCode/具名 agent）；空值、超长、含控制字符或通用库/框架 UA（`Go-http-client`、`hertz`、`python-requests`、`curl` 等）回退为 `opencode-go-cliproxyapi/<version>`；继续发送稳定的 `x-opencode-session`。
 - 429 分类细化：上游「The inference service is overloaded / at capacity」这类容量型 429 映射为 `transient_rate_limit`，只冷却该模型并沿用 `Retry-After`，不再按凭证额度耗尽处理；报文含 `quota` 时仍判为 `credential_quota`。
 - 后台 goroutine panic 隔离：stream pump、密钥文件轮询、周期体检统一用 `recoverBackground` 兜底，避免单个请求/轮询异常终止 CPA 进程或被宿主熔断整个插件。
